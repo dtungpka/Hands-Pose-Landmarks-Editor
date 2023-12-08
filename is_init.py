@@ -3,7 +3,7 @@ import os
 import face_alignment
 import numpy as np
 import imghdr
-import dlib
+#import dlib
 import cv2
 from skimage import io
 from PyQt5.QtGui import *
@@ -11,10 +11,33 @@ from PyQt5.Qt import *
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 import qdarkgraystyle
-
+import json
 import time
+import data_handler as dh
 
+
+
+tickbox_colors = ["#00ffff", "#008080", "#00ff00", "#808040", "#808080","#8080ff","#ff8040","#8000ff"]
+average_color = "#ffffff"
 #contains name, points, pixmap image, paths, and landmarkpaths of image
+
+
+class Outputdata:
+    '''
+    For all operations, the output data should be stored in this class:
+    Video > frame > pose/hand
+
+    Save, load, querry
+    Undo, redo
+    '''
+
+
+
+
+
+
+
+
 class ImageSet:
     def __init__(self):
         self.__pixmslap = None
@@ -200,7 +223,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.title = 'face landmark detection Program'
+        self.title = 'Hand Landmark Editing Tool v1.0'
         self.dw = QDesktopWidget()  # fit to the size of desktop
         self.x = 0
         self.y = 0
@@ -209,18 +232,32 @@ class MainWindow(QMainWindow):
         self._label = QLabel()  # labels that show no photo uploaded warnings
 
         self.currentImage = ImageSet()  # current image
-        self.imageFolder = []  # folder of images
-        self.imageFolderIndex = 0  # index of current image shown in image folder
-        self.imageFolderText = {}  # dictionary of texts that correspond to image in folder
-        self.drawn = False #whether landmarks are drawn or not
+        
+        
 
+        self.drawn = False #whether landmarks are drawn or not
+        self.data_path = self.get_data_path()  # get the path of metadata.json
+        self.data_folder = os.path.dirname(self.data_path)  # get the path of data folder
+        self.dataloader = dh.DataHandler(self.data_folder)  # initiate data handler
+        self.video_list = self.dataloader.get_video_list()  # get the list of videos
+        self.alt_names = self.dataloader.get_alt_name()
         self.initUI()  # initiate UI
 
-    def initUI(self):
 
+
+
+    def get_data_path(self):
+        #show a dialog to get the data path, by choosing a file name "metadata.json"
+        data_path = QFileDialog.getOpenFileName(self, "Open metadata.json", "metadata.json", "metadata.json file (metadata.json)")[0]
+        return data_path
+
+    def initUI(self):
         # resize the size of window
         self.setWindowTitle(self.title)
         self.setGeometry(self.x, self.y, self.width, self.height)
+
+        # create menu bar
+        self._create_menu_bar()
 
         # add graphic View into centralWidget
         self.viewer = PhotoViewer()
@@ -231,48 +268,70 @@ class MainWindow(QMainWindow):
         buttonWidget = QWidget()
 
         #create radioButton for detector
-        groupBox = QGroupBox("Type of Detector", buttonWidget)
+        groupBox = QGroupBox("Available Method", buttonWidget)
         groupBox.move(buttonWidget.x() + 5, buttonWidget.y() + 10)
-        groupBox.resize(140,120)
-        groupBox.setStyleSheet("background-color:#F16B6F")
+        
+        #groupBox.setStyleSheet("background-color:#F16B6F")
 
-        self.radio1 = QRadioButton("Pytorch", groupBox)
-        self.radio1.move(buttonWidget.x() + 5, buttonWidget.y() + 25)
-        self.radio1.clicked.connect(self.radioButtonClicked)
-        self.radio1.setChecked(True) #default is pytorch
+        
 
-        self.radio2 = QRadioButton("Dlib", groupBox)
-        self.radio2.move(buttonWidget.x() + 5, buttonWidget.y() + 45)
-        self.radio2.clicked.connect(self.radioButtonClicked)
 
-        self.radio3 = QRadioButton("CLM", groupBox)
-        self.radio3.move(buttonWidget.x() + 5, buttonWidget.y() + 65)
-        self.radio3.clicked.connect(self.radioButtonClicked)
+        self.methods_tickbox = {}
+        for i, method in enumerate(self.dataloader.get_method_list()):
+            self.methods_tickbox[method] = QCheckBox(method, groupBox)
+            self.methods_tickbox[method].move(buttonWidget.x() + 5, buttonWidget.y() + 25 + i*20)
+            self.methods_tickbox[method].clicked.connect(self.checkboxClicked)
+            self.methods_tickbox[method].setChecked(False)
+            #set color for each tickbox
+            self.methods_tickbox[method].setStyleSheet("color:" + tickbox_colors[i])
+            #bind each tickbox with corresponding 1,2,3,4,5,6,7,8 key
+            if i < 8:
+                self.methods_tickbox[method].setShortcut(str(i+1))
+                
 
-        self.radio4 = QRadioButton("CSC", groupBox)
-        self.radio4.move(buttonWidget.x() + 5, buttonWidget.y() + 85)
-        self.radio4.clicked.connect(self.radioButtonClicked)
+        #resize the groupBox to fit all the tickboxes
+        groupBox.resize(200, 25 + len(self.dataloader.get_method_list())*20)
 
-        # create upload label
-        uploadLb = QLabel("1. Upload", buttonWidget)
-        uploadLb.setFont(QFont("Book Antiqua", 14, QFont.Bold))
-        uploadLb.move(buttonWidget.x(), buttonWidget.y() + 200)
+        #Create a average checkbox
+        self.average_tickbox = QCheckBox("Average", buttonWidget)
+        self.average_tickbox.move(buttonWidget.x() + 5, buttonWidget.y() + 40 + len(self.dataloader.get_method_list())*20)
+        self.average_tickbox.clicked.connect(self.checkboxClicked)
+        self.average_tickbox.setChecked(False)
+        self.average_tickbox.setStyleSheet("color:" + average_color)
+        self.average_tickbox.setShortcut("`")
+
+
+
+
+        # create video source label
+        videoSourceLb = QLabel("Video Source", buttonWidget)
+        videoSourceLb.setFont(QFont("Book Antiqua", 14, QFont.Bold))
+        videoSourceLb.move(buttonWidget.x(), buttonWidget.y() + 200)
+
+        #create a dropdown list for video source
+        self.videoSource = QComboBox(buttonWidget)
+        self.videoSource.move(buttonWidget.x() + 5, buttonWidget.y() + 235) 
+        self.videoSource.resize(140, 50)
+        alt_names = [self.alt_names[video] for video in self.alt_names]
+        self.videoSource.addItems(alt_names)
+        self.videoSource.currentIndexChanged.connect(self.videoSourceChanged)
+
 
         # create upload buttons
-        uploadImBut = QPushButton('Image(ctrl+i)', buttonWidget)
-        uploadImBut.setFont(QFont('Futura',13, QFont.Bold))
-        uploadImBut.resize(140, 50)
-        uploadImBut.move(buttonWidget.x() + 5, buttonWidget.y() + 235)
+        # uploadImBut = QPushButton('Image(ctrl+i)', buttonWidget)
+        # uploadImBut.setFont(QFont('Futura',13, QFont.Bold))
+        # uploadImBut.resize(140, 50)
+        # uploadImBut.move(buttonWidget.x() + 5, buttonWidget.y() + 235)
 
-        uploadTeBut = QPushButton('Text(ctrl+t)', buttonWidget)
-        uploadTeBut.setFont(QFont('Futura', 13, QFont.Bold))
-        uploadTeBut.resize(140, 50)
-        uploadTeBut.move(buttonWidget.x() + 150, buttonWidget.y() + 235)
+        # uploadTeBut = QPushButton('Text(ctrl+t)', buttonWidget)
+        # uploadTeBut.setFont(QFont('Futura', 13, QFont.Bold))
+        # uploadTeBut.resize(140, 50)
+        # uploadTeBut.move(buttonWidget.x() + 150, buttonWidget.y() + 235)
 
-        uploadFoBut = QPushButton('folder(ctrl+f)', buttonWidget)
-        uploadFoBut.setFont(QFont('Futura', 13, QFont.Bold))
-        uploadFoBut.resize(140, 50)
-        uploadFoBut.move(buttonWidget.x() + 5, buttonWidget.y() + 290)
+        # uploadFoBut = QPushButton('folder(ctrl+f)', buttonWidget)
+        # uploadFoBut.setFont(QFont('Futura', 13, QFont.Bold))
+        # uploadFoBut.resize(140, 50)
+        # uploadFoBut.move(buttonWidget.x() + 5, buttonWidget.y() + 290)
 
         # create detect label
         detectLb = QLabel("2. Detect", buttonWidget)
@@ -330,12 +389,12 @@ class MainWindow(QMainWindow):
         self.qDockWidget.setFixedSize(300, self.dw.height())
 
         # upload button connection
-        uploadImBut.clicked.connect(self.uploadImButClicked)
-        uploadImBut.setShortcut("ctrl+i")
-        uploadTeBut.clicked.connect(self.uploadTeButClicked)
-        uploadTeBut.setShortcut("ctrl+t")
-        uploadFoBut.clicked.connect(self.uploadFoButClicked)
-        uploadFoBut.setShortcut("ctrl+f")
+        # uploadImBut.clicked.connect(self.uploadImButClicked)
+        # uploadImBut.setShortcut("ctrl+i")
+        # uploadTeBut.clicked.connect(self.uploadTeButClicked)
+        # uploadTeBut.setShortcut("ctrl+t")
+        # uploadFoBut.clicked.connect(self.uploadFoButClicked)
+        # uploadFoBut.setShortcut("ctrl+f")
 
         # detection button connection
         detectBut.clicked.connect(self.detectButClicked)
@@ -354,7 +413,7 @@ class MainWindow(QMainWindow):
         leftArrowBut.setShortcut(Qt.Key_Left)
 
         #initiate detector
-        self.dlib_detector = dlib.get_frontal_face_detector()
+        #self.dlib_detector = dlib.get_frontal_face_detector()
         #self.dlib_predictor = dlib.shape_predictor(
         #    "./shape_predictor_68_face_landmarks.dat"
         #)
@@ -742,18 +801,71 @@ class MainWindow(QMainWindow):
 
         self.currentImage.point = points_all
         self.drawPoints(self.currentImage.point)
+    #menu bar
+    def _create_menu_bar(self):
+        self.menu_bar = self.menuBar()
+        self.file_menu = self.menu_bar.addMenu("File")
+        self.edit_menu = self.menu_bar.addMenu("Edit")
+        self.help_menu = self.menu_bar.addMenu("Help")
+
+        self._create_file_menu_actions()
+        self._create_edit_menu_actions()
+        self._create_help_menu_actions()
+
+    def _create_file_menu_actions(self):
+        self.open_action = QAction("Open", self)
+        self.open_action.setShortcut("Ctrl+O")
+        self.open_action.triggered.connect(self.open_action_triggered)
+        self.file_menu.addAction(self.open_action)
+
+        self.save_action = QAction("Save", self)
+        self.save_action.setShortcut("Ctrl+S")
+        self.save_action.triggered.connect(self.save_action_triggered)
+        self.file_menu.addAction(self.save_action)
+
+        self.exit_action = QAction("Exit", self)
+        self.exit_action.setShortcut("Ctrl+Q")
+        self.exit_action.triggered.connect(self.close)
+        self.file_menu.addAction(self.exit_action)
+
+    def _create_edit_menu_actions(self):
+        self.undo_action = QAction("Undo", self)
+        self.undo_action.setShortcut("Ctrl+Z")
+        self.undo_action.triggered.connect(self.undo_action_triggered)
+        self.edit_menu.addAction(self.undo_action)
+
+        self.redo_action = QAction("Redo", self)
+        self.redo_action.setShortcut("Ctrl+Y")
+        self.redo_action.triggered.connect(self.redo_action_triggered)
+        self.edit_menu.addAction(self.redo_action)
+
+    def _create_help_menu_actions(self):
+        self.about_action = QAction("About", self)
+        self.about_action.triggered.connect(self.about_action_triggered)
+        self.help_menu.addAction(self.about_action)
+
+    def open_action_triggered(self):
+        pass
+
+    def save_action_triggered(self):
+        pass
+
+    def undo_action_triggered(self):
+        pass
+
+    def redo_action_triggered(self):
+        pass
+
+    def about_action_triggered(self):
+        pass
 
     #show which radio button was clicked
-    def radioButtonClicked(self):
-        msg = ''
-        if self.radio1.isChecked():
-            msg = 'pytorch'
-        elif self.radio2.isChecked():
-            msg = 'dlib'
-        elif self.radio3.isChecked():
-            msg = 'CLM'
-        else:
-            msg = 'Ensemble of Regression Tree'
+    def checkboxClicked(self):
+        #show a message box
+        QMessageBox.about(self, "Message", "You clicked " + self.sender().text())
+    def videoSourceChanged(self):
+        #show a message box
+        QMessageBox.about(self, "Message", "You selected " + self.sender().currentText())
 
 
 if __name__ == '__main__':
