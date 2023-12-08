@@ -14,12 +14,21 @@ import qdarkgraystyle
 import json
 import time
 import data_handler as dh
+import pickle as pkl
 
 
 
 tickbox_colors = ["#00ffff", "#008080", "#00ff00", "#808040", "#808080","#8080ff","#ff8040","#8000ff"]
 average_color = "#ffffff"
 #contains name, points, pixmap image, paths, and landmarkpaths of image
+
+class OperationsType:
+    ADD_SKELETON = 0
+    REMOVE_SKELETON = 1
+    ADD_KEYPOINT = 2
+    REMOVE_KEYPOINT = 3
+    MOVE_KEYPOINT = 4
+
 
 
 class Outputdata:
@@ -30,6 +39,57 @@ class Outputdata:
     Save, load, querry
     Undo, redo
     '''
+    def __init__(self) -> None:
+        self.data = {}
+        self.history = []
+        self.history_pointer = 0
+
+    def save(self, path):
+        with open(path, 'wb') as f:
+            pkl.dump(self.data, f)
+
+    def load(self, path):
+        with open(path, 'rb') as f:
+            self.data = pkl.load(f)
+
+    def get_skeleton(self, video, frame):
+        return self.data[video][frame]
+    
+    def add_skeleton(self, video, frame, skeleton):
+        if video not in self.data:
+            self.data[video] = {}
+        self.history.append((OperationsType.ADD_SKELETON, video, frame, skeleton))
+        self.history_pointer += 1
+        self.data[video][frame] = skeleton
+
+        #only save the last 100 operations
+        if len(self.history) > 100:
+            self.history = self.history[-100:]
+            self.history_pointer = 100
+        
+
+    def remove_skeleton(self, video, frame):
+        self.history.append((OperationsType.REMOVE_SKELETON, video, frame, self.data[video][frame]))
+        self.history_pointer += 1
+        del self.data[video][frame]
+
+    def undo_action(self):
+        if self.history_pointer > 0:
+            self.history_pointer -= 1
+            operation, video, frame, data = self.history[self.history_pointer]
+            if operation == OperationsType.ADD_SKELETON:
+                self.add_skeleton(video, frame,data)
+
+    def redo_action(self):
+        if self.history_pointer < len(self.history):
+            operation, video, frame, data = self.history[self.history_pointer]
+            if operation == OperationsType.ADD_SKELETON:
+                self.add_skeleton(video, frame,data)
+            self.history_pointer += 1
+
+
+
+
 
 
 
@@ -255,6 +315,9 @@ class MainWindow(QMainWindow):
         # resize the size of window
         self.setWindowTitle(self.title)
         self.setGeometry(self.x, self.y, self.width, self.height)
+        #set icon
+        self.setWindowIcon(QIcon('Icons/Nahida_1.ico'))
+        
 
         # create menu bar
         self._create_menu_bar()
@@ -290,7 +353,7 @@ class MainWindow(QMainWindow):
                 
 
         #resize the groupBox to fit all the tickboxes
-        groupBox.resize(200, 25 + len(self.dataloader.get_method_list())*20)
+        groupBox.resize(250, 25 + len(self.dataloader.get_method_list())*20)
 
         #Create a average checkbox
         self.average_tickbox = QCheckBox("Average", buttonWidget)
@@ -311,74 +374,51 @@ class MainWindow(QMainWindow):
         #create a dropdown list for video source
         self.videoSource = QComboBox(buttonWidget)
         self.videoSource.move(buttonWidget.x() + 5, buttonWidget.y() + 235) 
-        self.videoSource.resize(140, 50)
+        self.videoSource.resize(250, 50)
         alt_names = [self.alt_names[video] for video in self.alt_names]
         self.videoSource.addItems(alt_names)
         self.videoSource.currentIndexChanged.connect(self.videoSourceChanged)
 
+        #Add a text label below, show:
+        #Video name
+        #Labeled %d out of %d frames (x.xx%)
 
-        # create upload buttons
-        # uploadImBut = QPushButton('Image(ctrl+i)', buttonWidget)
-        # uploadImBut.setFont(QFont('Futura',13, QFont.Bold))
-        # uploadImBut.resize(140, 50)
-        # uploadImBut.move(buttonWidget.x() + 5, buttonWidget.y() + 235)
+        self.videoNameLb = QLabel("Video Name", buttonWidget)
+        self.videoNameLb.setFont(QFont("Book Antiqua", 14, QFont.Bold))
+        self.videoNameLb.move(buttonWidget.x(), buttonWidget.y() + 300)
 
-        # uploadTeBut = QPushButton('Text(ctrl+t)', buttonWidget)
-        # uploadTeBut.setFont(QFont('Futura', 13, QFont.Bold))
-        # uploadTeBut.resize(140, 50)
-        # uploadTeBut.move(buttonWidget.x() + 150, buttonWidget.y() + 235)
+        self.videoProgressLb = QLabel("Labeled 0 out of 0 frames (0.00%)", buttonWidget)
+        self.videoProgressLb.setFont(QFont("Book Antiqua", 14, QFont.Bold))
+        self.videoProgressLb.move(buttonWidget.x(), buttonWidget.y() + 335)
 
-        # uploadFoBut = QPushButton('folder(ctrl+f)', buttonWidget)
-        # uploadFoBut.setFont(QFont('Futura', 13, QFont.Bold))
-        # uploadFoBut.resize(140, 50)
-        # uploadFoBut.move(buttonWidget.x() + 5, buttonWidget.y() + 290)
-
+        
         # create detect label
-        detectLb = QLabel("2. Detect", buttonWidget)
+        detectLb = QLabel("Info", buttonWidget)
         detectLb.setFont(QFont("Book Antiqua", 14, QFont.Bold))
         detectLb.move(buttonWidget.x(), buttonWidget.y() + 450)
 
-        # create detect buttons
-        detectBut = QPushButton('Detect(ctrl+d)', buttonWidget)
-        detectBut.setFont(QFont('Futura', 13, QFont.Bold))
-        detectBut.resize(140, 50)
-        detectBut.move(buttonWidget.x() + 5, buttonWidget.y() + 485)
+        #Add a text label below, show:
+        #Frame %d out of %d (%f.2%)
 
-        detectClBut = QPushButton('Detection Clear(ctrl+c)', buttonWidget)
-        detectClBut.setFont(QFont('Futura', 13, QFont.Bold))
-        detectClBut.resize(140, 50)
-        detectClBut.move(buttonWidget.x() + 150, buttonWidget.y() + 485)
+        self.frameInfoLb = QLabel("Frame 0 out of 0 (0.00%)", buttonWidget)
+        self.frameInfoLb.setFont(QFont("Book Antiqua", 14, QFont.Bold))
+        self.frameInfoLb.move(buttonWidget.x(), buttonWidget.y() + 485)
 
-        # create save label
-        saveLb = QLabel("3. Save", buttonWidget)
-        saveLb.setFont(QFont("Book Antiqua", 13, QFont.Bold))
-        saveLb.move(buttonWidget.x(), buttonWidget.y() + 600)
+        #Create a slider to control the frame
+        
+        navLb = QLabel("Navigation", buttonWidget)
+        navLb.setFont(QFont("Book Antiqua", 14, QFont.Bold))
+        navLb.move(buttonWidget.x(), buttonWidget.y() + 550)
 
-        # create save buttons
-        saveBut = QPushButton('Save(ctrl+s)', buttonWidget)
-        saveBut.setFont(QFont('Futura', 13, QFont.Bold))
-        saveBut.resize(140, 50)
-        saveBut.move(buttonWidget.x() + 5, buttonWidget.y() + 635)
-
-        # create left and right buttons
-        right_arrow_pixmap = QPixmap('Icons/right_arrow.png')
-        left_arrow_pixmap = QPixmap('Icons/left_arrow.png')
-        right_arrow_icon = QIcon(right_arrow_pixmap)
-        left_arrow_icon = QIcon(left_arrow_pixmap)
-
-        rightArrowBut = QPushButton(buttonWidget)
-        rightArrowBut.setIcon(right_arrow_icon)
-        leftArrowBut = QPushButton(buttonWidget)
-        leftArrowBut.setIcon(left_arrow_icon)
-
-        rightArrowBut.move(buttonWidget.x() + 150, buttonWidget.y() + 800)
-        leftArrowBut.move(buttonWidget.x() + 120, buttonWidget.y() + 800)
-
-        # create text label
-        self.textLb = QLabel(buttonWidget)
-        self.textLb.move(buttonWidget.x() + 5, buttonWidget.y() + 380)
-        self.textLb.setFont(QFont('Futura', 12))
-        self.textLb.setText('Image: ')
+        self.frameSlider = QSlider(Qt.Horizontal, buttonWidget)
+        self.frameSlider.move(buttonWidget.x() + 5, buttonWidget.y() + 585)
+        self.frameSlider.resize(250, 50)
+        self.frameSlider.setMinimum(0)
+        self.frameSlider.setMaximum(100)
+        self.frameSlider.setValue(0)
+        self.frameSlider.setTickPosition(QSlider.TicksBelow)
+        self.frameSlider.setTickInterval(1)
+        self.frameSlider.valueChanged.connect(self.frameSliderChanged)
 
         # create qdockwidget and add the button widget to it
         self.qDockWidget = QDockWidget("")
@@ -387,6 +427,76 @@ class MainWindow(QMainWindow):
         self.qDockWidget.setFeatures(QDockWidget.NoDockWidgetFeatures)
         self.addDockWidget(Qt.RightDockWidgetArea, self.qDockWidget)
         self.qDockWidget.setFixedSize(300, self.dw.height())
+
+        #Add 4 btns: Nav to pre not labeled frame, Nav to next not labeled frame, Nav to pre frame, Nav to next frame, using icons
+        #add 2 btns: play and pause, using icons
+        
+        #nav to pre not labeled frame
+        pre_not_labeled_pixmap = QPixmap('Icons/pre_not_labeled.png')
+        pre_not_labeled_icon = QIcon(pre_not_labeled_pixmap)
+        pre_not_labeled_btn = QPushButton(buttonWidget)
+        pre_not_labeled_btn.setIcon(pre_not_labeled_icon)
+        pre_not_labeled_btn.resize(50, 50)
+        pre_not_labeled_btn.move(buttonWidget.x() + 5, buttonWidget.y() + 650)
+
+        #nav to next not labeled frame
+        next_not_labeled_pixmap = QPixmap('Icons/next_not_labeled.png')
+        next_not_labeled_icon = QIcon(next_not_labeled_pixmap)
+        next_not_labeled_btn = QPushButton(buttonWidget)
+        next_not_labeled_btn.setIcon(next_not_labeled_icon)
+        next_not_labeled_btn.resize(50, 50)
+        next_not_labeled_btn.move(buttonWidget.x() + 170, buttonWidget.y() + 650)
+
+        #nav to pre frame
+        pre_frame_pixmap = QPixmap('Icons/pre_frame.png')
+        pre_frame_icon = QIcon(pre_frame_pixmap)
+        pre_frame_btn = QPushButton(buttonWidget)
+        pre_frame_btn.setIcon(pre_frame_icon)
+        pre_frame_btn.resize(50, 50)
+        pre_frame_btn.move(buttonWidget.x() + 60, buttonWidget.y() + 650)
+
+        #nav to next frame
+        next_frame_pixmap = QPixmap('Icons/next_frame.png')
+        next_frame_icon = QIcon(next_frame_pixmap)
+        next_frame_btn = QPushButton(buttonWidget)
+        next_frame_btn.setIcon(next_frame_icon)
+        next_frame_btn.resize(50, 50)
+        next_frame_btn.move(buttonWidget.x() + 115, buttonWidget.y() + 650)
+
+        #play
+        play_pixmap = QPixmap('Icons/play.png')
+        play_icon = QIcon(play_pixmap)
+        play_btn = QPushButton(buttonWidget)
+        play_btn.setIcon(play_icon)
+        play_btn.resize(50, 50)
+        play_btn.move(buttonWidget.x() + 60, buttonWidget.y() + 705)
+
+        #pause
+        pause_pixmap = QPixmap('Icons/pause.png')
+        pause_icon = QIcon(pause_pixmap)
+        pause_btn = QPushButton(buttonWidget)
+        pause_btn.setIcon(pause_icon)
+        pause_btn.resize(50, 50)
+        pause_btn.move(buttonWidget.x() + 115, buttonWidget.y() + 705)
+
+        #create a timer to control the play/pause button
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.timer_timeout)
+        self.timer.setInterval(1000/30) #30 fps
+
+        #connect the buttons to corresponding functions
+        pre_not_labeled_btn.clicked.connect(self.pre_not_labeled_btn_clicked)
+        next_not_labeled_btn.clicked.connect(self.next_not_labeled_btn_clicked)
+        pre_frame_btn.clicked.connect(self.pre_frame_btn_clicked)
+        next_frame_btn.clicked.connect(self.next_frame_btn_clicked)
+        play_btn.clicked.connect(self.play_btn_clicked)
+        pause_btn.clicked.connect(self.pause_btn_clicked)
+        
+
+
+
+
+
 
         # upload button connection
         # uploadImBut.clicked.connect(self.uploadImButClicked)
@@ -397,20 +507,14 @@ class MainWindow(QMainWindow):
         # uploadFoBut.setShortcut("ctrl+f")
 
         # detection button connection
-        detectBut.clicked.connect(self.detectButClicked)
-        detectBut.setShortcut("ctrl+d")
-        detectClBut.clicked.connect(self.detectClButClicked)
-        detectClBut.setShortcut("ctrl+c")
+        # detectBut.clicked.connect(self.detectButClicked)
+        # detectBut.setShortcut("ctrl+d")
+        # detectClBut.clicked.connect(self.detectClButClicked)
+        # detectClBut.setShortcut("ctrl+c")
 
-        # save button connectoin
-        saveBut.clicked.connect(self.saveButClicked)
-        saveBut.setShortcut("ctrl+s")
-
-        # right and left arrow button connection
-        rightArrowBut.clicked.connect(self.rightArrowButClicked)
-        rightArrowBut.setShortcut(Qt.Key_Right)
-        leftArrowBut.clicked.connect(self.leftArrowButClicked)
-        leftArrowBut.setShortcut(Qt.Key_Left)
+        # # save button connectoin
+        # saveBut.clicked.connect(self.saveButClicked)
+        # saveBut.setShortcut("ctrl+s")
 
         #initiate detector
         #self.dlib_detector = dlib.get_frontal_face_detector()
@@ -866,6 +970,25 @@ class MainWindow(QMainWindow):
     def videoSourceChanged(self):
         #show a message box
         QMessageBox.about(self, "Message", "You selected " + self.sender().currentText())
+    def frameSliderChanged(self):
+        #show a message box
+        QMessageBox.about(self, "Message", "You selected " + str(self.sender().value()))
+
+    def pre_not_labeled_btn_clicked(self):
+        pass
+    def next_not_labeled_btn_clicked(self):
+        pass
+    def pre_frame_btn_clicked(self):
+        pass
+    def next_frame_btn_clicked(self):
+        pass
+    def play_btn_clicked(self):
+        self.timer.start()
+    def pause_btn_clicked(self):
+        self.timer.stop()
+    def timer_timeout(self):
+        pass
+
 
 
 if __name__ == '__main__':
