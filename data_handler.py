@@ -4,6 +4,7 @@ import json
 import cv2
 import datetime as dt
 import time
+import pickle as pkl
 #from PyQt5.QtGui import *
 
 class DataHandler:
@@ -58,8 +59,12 @@ class DataHandler:
 
         #TODO: load in UI, create a set_skeleton_data method for later use (or could change to pickle file)
         for method in self.get_current_method_list():
-            with open(os.path.join(self.data_path, self.metadata[video_name]['methods'][method]), 'r',encoding='utf-8') as f:
-                self.skeleton_data[method] = json.load(f)
+            if '.json' in self.metadata[video_name]['methods'][method]:
+                with open(os.path.join(self.data_path, self.metadata[video_name]['methods'][method]), 'r',encoding='utf-8') as f:
+                    self.skeleton_data[method] = json.load(f)
+            elif '.lmks' in self.metadata[video_name]['methods'][method]:
+                with open(os.path.join(self.data_path, self.metadata[video_name]['methods'][method]), 'rb') as f:
+                    self.skeleton_data[method] = pkl.load(f)
 
         self.current_frame = 0
         #set the total frame by reading the video using cv2
@@ -77,6 +82,12 @@ class DataHandler:
         '''
         assert self.current_video_data is not None, 'No current video is set'
         return list(self.current_video_data['methods'].keys())
+    def get_total_frames(self):
+        '''
+        return the total frame of the current video
+        '''
+        assert self.current_video_data is not None, 'No current video is set'
+        return self.total_frame
     def get_duration(self):
         '''
         return the duration of the current video, format: HH:MM:SS, rounded to the nearest .01
@@ -119,14 +130,44 @@ class DataHandler:
             return _s[0]+'.'+_s[1][:2]
         else:
             return s
-    def get_current_frame_skeleton(self, method):
+    def get_video_dimension(self):
+        '''
+        return the dimension of the current video
+        '''
+        assert self.current_video_data is not None, 'No current video is set'
+        return self._width, self._height
+    def get_current_frame_skeleton(self, method,as_pixels=True):
         '''
         return the skeleton data for the current frame and the current method
         '''
         assert self.current_video_data is not None, 'No current video is set'
         assert method in self.get_current_method_list(), 'Method not found'
-        pose = self.skeleton_data[method]['pose'][str(self.current_frame)]
-        hand = self.skeleton_data[method]['hands'][str(self.current_frame)]
+        pose = self.skeleton_data[method]['pose'][self.current_frame].copy()
+        hand = self.skeleton_data[method]['hands'][self.current_frame].copy()
+
+        if as_pixels:
+            for point in pose:
+                #pose is a list of x,y,z,visibility, multiply by width and height to get the pixel value
+                point[0] = point[0]
+                point[1] = point[1]
+            for hand_ in hand:
+                for point in hand[hand_]['landmarks']:
+                    #hand is a dict, landmarks is a list of x,y,z, multiply by width and height to get the pixel value
+                    point[0] = point[0]
+                    point[1] = point[1]
+
+        return pose, hand
+    def pixel_skeleton_to_normalized(self, pose, hand):
+        '''
+        convert the pixel skeleton to normalized
+        '''
+        for point in pose:
+            point[0] = point[0]/self._width
+            point[1] = point[1]/self._height
+        for hand_ in hand:
+            for point in hand[hand_]['landmarks']:
+                point[0] = point[0]/self._width
+                point[1] = point[1]/self._height
         return pose, hand
     def get_alt_name(self):
         '''

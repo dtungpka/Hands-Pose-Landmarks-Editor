@@ -17,7 +17,7 @@ import data_handler as dh
 import pickle as pkl
 
 
-
+VER = "v1.0"
 tickbox_colors = ["#00ffff", "#008080", "#00ff00", "#808040", "#808080","#8080ff","#ff8040","#8000ff"]
 average_color = "#ffffff"
 #contains name, points, pixmap image, paths, and landmarkpaths of image
@@ -79,6 +79,9 @@ class Outputdata:
             operation, video, frame, data = self.history[self.history_pointer]
             if operation == OperationsType.ADD_SKELETON:
                 self.add_skeleton(video, frame,data)
+            elif operation == OperationsType.REMOVE_SKELETON:
+                self.add_skeleton(video, frame,data)
+
 
     def redo_action(self):
         if self.history_pointer < len(self.history):
@@ -86,7 +89,13 @@ class Outputdata:
             if operation == OperationsType.ADD_SKELETON:
                 self.add_skeleton(video, frame,data)
             self.history_pointer += 1
-
+    def get_all_labeled_frames(self, video):
+        #check if video exists
+        if video not in self.data:
+            return 0,[]
+        else:
+            #return the number of labeled frames and a list of labeled frames
+            return len(self.data[video]), list(self.data[video].keys())
 
 
 
@@ -102,13 +111,13 @@ class ImageSet:
     def __init__(self):
         self.__pixmslap = None
         self.__path = ""
-        self.__point = []
-        self.__landmarkPath = []
+        self.__point = {}
+        self.__landmarkPath = {}
         self.__name = ""
 
     @property  # get pixmap
     def pixmap(self):
-        return self.__pixmap
+        return self.__pixmslap
 
     @pixmap.setter  # set pixmap
     def pixmap(self, pixmap):
@@ -125,7 +134,6 @@ class ImageSet:
     @property  # get point
     def point(self):
         return self.__point
-
     @point.setter  # set point
     def point(self, point):
         self.__point = point
@@ -136,6 +144,7 @@ class ImageSet:
 
     @landmarkPath.setter  # set landmarkPath
     def landmarkPath(self, landmarkPath):
+        print("set landmarkPath")
         self.__landmarkPath = landmarkPath
 
     @property  # get name
@@ -182,8 +191,9 @@ class PhotoViewer(QGraphicsView):
 
             self._zoom = 0
 
-    def setPhoto(self, pixmap=None):
-        self._zoom = 0
+    def setPhoto(self, pixmap=None,changeVideo=False):
+        if changeVideo:
+            self._zoom = 0
 
         if pixmap and not pixmap.isNull():
 
@@ -213,8 +223,8 @@ class PhotoViewer(QGraphicsView):
         else:
             self._empty = True
             self._photo.setPixmap(QPixmap())
-
-        self.fitInView2()
+        if changeVideo:
+            self.fitInView2()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Control:
@@ -240,6 +250,19 @@ class PhotoViewer(QGraphicsView):
                     self.fitInView2()
                 else:
                     self._zoom = 0
+            elif modifiers == Qt.ShiftModifier:
+                #if shift key is pressed, scroll horizontally
+                if event.angleDelta().y() > 0:  # if scroll wheel forward
+                    self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - int(10*self._zoom))
+                else:
+                    self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() + int(10*self._zoom))
+            else:
+                #if no key is pressed, scroll vertically
+                if event.angleDelta().y() > 0:
+                    self.verticalScrollBar().setValue(self.verticalScrollBar().value() - int(10*self._zoom))
+                else:
+                    self.verticalScrollBar().setValue(self.verticalScrollBar().value() + int(10*self._zoom))
+
 
     def addItem(self, item):
         return self._scene.addItem(item)
@@ -247,15 +270,17 @@ class PhotoViewer(QGraphicsView):
 
 class Landmark_path(QGraphicsPathItem):
 
-    def __init__(self, path):
+    def __init__(self, path, parent=None,moveable=True):
         super(Landmark_path, self).__init__()
         self.path = path
         self.setPath(path)
         pos = self.scenePos()
         self.x = pos.x()
         self.y = pos.y()
-        self.setFlag(QGraphicsItem.ItemIsMovable, True)
-        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self.moved = True
+        self.parent = parent
+        self.setFlag(QGraphicsItem.ItemIsMovable, moveable)
+        self.setFlag(QGraphicsItem.ItemIsSelectable, moveable)
 
     def mousePressEvent(self, event):
         event.accept()
@@ -272,7 +297,12 @@ class Landmark_path(QGraphicsPathItem):
         point = self.mapToScene(pos.x(), pos.y())
         self.x = point.x()
         self.y = point.y()
-
+        self.moved = True
+        self.parent.update_skeleton()
+    def reset(self):
+        self.moved = False
+    def is_moved(self):
+        return self.moved
     def returnCoordinates(self):
         self.x = self.scenePos().x()
         self.y = self.scenePos().y()
@@ -283,34 +313,53 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.title = 'Hand Landmark Editing Tool v1.0'
+        self.title = f'Hand Landmark Editing Tool {VER}'
         self.dw = QDesktopWidget()  # fit to the size of desktop
         self.x = 0
         self.y = 0
         self.width = self.dw.width()  # width of the desktop
         self.height = self.dw.height()  # height of the desktop
         self._label = QLabel()  # labels that show no photo uploaded warnings
-
+        self.last_frame = -1
         self.currentImage = ImageSet()  # current image
-        
-        
-
+        self.landmarks_data = {}  # landmarks data of current frame
+        self.last_checked_methods = []
+        self.checked_methods = []
         self.drawn = False #whether landmarks are drawn or not
         self.data_path = self.get_data_path()  # get the path of metadata.json
         self.data_folder = os.path.dirname(self.data_path)  # get the path of data folder
         self.dataloader = dh.DataHandler(self.data_folder)  # initiate data handler
         self.video_list = self.dataloader.get_video_list()  # get the list of videos
         self.alt_names = self.dataloader.get_alt_name()
+        self.playing_vid = False  # whether the video is playing or not
+        self.current_frame = 0  # current frame
+        self.gt_data = Outputdata()  # initiate output data
         self.initUI()  # initiate UI
+        #maximize the window
+        self.showMaximized()
+        #show the window
+        self.show()
+        self.videoSourceChanged()
+
+
+
+
 
 
 
 
     def get_data_path(self):
+        #Check if "D:\2023-2024\Research\Skeleton-ed\metadata.json" exists then use it
+        if os.path.exists("D:\\2023-2024\\Research\\Outskeleton\\Skeleton-ed\\metadata.json"):
+            return "D:\\2023-2024\\Research\\Outskeleton\\Skeleton-ed\\metadata.json"
         #show a dialog to get the data path, by choosing a file name "metadata.json"
         data_path = QFileDialog.getOpenFileName(self, "Open metadata.json", "metadata.json", "metadata.json file (metadata.json)")[0]
-        return data_path
 
+        #if the user did not choose any file, exit the program
+        if data_path == "":
+            sys.exit()
+
+        return data_path
     def initUI(self):
         # resize the size of window
         self.setWindowTitle(self.title)
@@ -356,12 +405,17 @@ class MainWindow(QMainWindow):
         groupBox.resize(250, 25 + len(self.dataloader.get_method_list())*20)
 
         #Create a average checkbox
-        self.average_tickbox = QCheckBox("Average", buttonWidget)
+        self.average_tickbox = QCheckBox("Show average only", buttonWidget)
         self.average_tickbox.move(buttonWidget.x() + 5, buttonWidget.y() + 40 + len(self.dataloader.get_method_list())*20)
         self.average_tickbox.clicked.connect(self.checkboxClicked)
         self.average_tickbox.setChecked(False)
         self.average_tickbox.setStyleSheet("color:" + average_color)
         self.average_tickbox.setShortcut("`")
+
+        #create a btn to Calculate average
+        self.calculate_average_btn = QPushButton("Calculate missing skeleton", buttonWidget)
+        self.calculate_average_btn.move(buttonWidget.x() + 5, buttonWidget.y() + 65 + len(self.dataloader.get_method_list())*20)
+        self.calculate_average_btn.clicked.connect(self.calculate_average_btn_clicked)
 
 
 
@@ -384,11 +438,11 @@ class MainWindow(QMainWindow):
         #Labeled %d out of %d frames (x.xx%)
 
         self.videoNameLb = QLabel("Video Name", buttonWidget)
-        self.videoNameLb.setFont(QFont("Book Antiqua", 14, QFont.Bold))
+        #self.videoNameLb.setFont(QFont("Book Antiqua", 14, QFont.Bold))
         self.videoNameLb.move(buttonWidget.x(), buttonWidget.y() + 300)
 
         self.videoProgressLb = QLabel("Labeled 0 out of 0 frames (0.00%)", buttonWidget)
-        self.videoProgressLb.setFont(QFont("Book Antiqua", 14, QFont.Bold))
+        self.videoProgressLb.setFont(QFont("Book Antiqua", 10, QFont.Bold))
         self.videoProgressLb.move(buttonWidget.x(), buttonWidget.y() + 335)
 
         
@@ -411,13 +465,14 @@ class MainWindow(QMainWindow):
         navLb.move(buttonWidget.x(), buttonWidget.y() + 550)
 
         self.frameSlider = QSlider(Qt.Horizontal, buttonWidget)
+        self.frameSlider.setTracking(True)
         self.frameSlider.move(buttonWidget.x() + 5, buttonWidget.y() + 585)
         self.frameSlider.resize(250, 50)
         self.frameSlider.setMinimum(0)
-        self.frameSlider.setMaximum(100)
+        self.frameSlider.setMaximum(200)
         self.frameSlider.setValue(0)
         self.frameSlider.setTickPosition(QSlider.TicksBelow)
-        self.frameSlider.setTickInterval(1)
+        self.frameSlider.setTickInterval(200)
         self.frameSlider.valueChanged.connect(self.frameSliderChanged)
 
         # create qdockwidget and add the button widget to it
@@ -438,6 +493,10 @@ class MainWindow(QMainWindow):
         pre_not_labeled_btn.setIcon(pre_not_labeled_icon)
         pre_not_labeled_btn.resize(50, 50)
         pre_not_labeled_btn.move(buttonWidget.x() + 5, buttonWidget.y() + 650)
+        #set tooltip
+        pre_not_labeled_btn.setToolTip("Navitage to previous not labeled frame")
+        #set shortcut to upper arrow
+        pre_not_labeled_btn.setShortcut(Qt.Key_Up)
 
         #nav to next not labeled frame
         next_not_labeled_pixmap = QPixmap('Icons/next_not_labeled.png')
@@ -446,6 +505,10 @@ class MainWindow(QMainWindow):
         next_not_labeled_btn.setIcon(next_not_labeled_icon)
         next_not_labeled_btn.resize(50, 50)
         next_not_labeled_btn.move(buttonWidget.x() + 170, buttonWidget.y() + 650)
+        #set tooltip
+        next_not_labeled_btn.setToolTip("Navitage to next not labeled frame")
+        #set shortcut to down arrow
+        next_not_labeled_btn.setShortcut(Qt.Key_Down)
 
         #nav to pre frame
         pre_frame_pixmap = QPixmap('Icons/pre_frame.png')
@@ -454,6 +517,10 @@ class MainWindow(QMainWindow):
         pre_frame_btn.setIcon(pre_frame_icon)
         pre_frame_btn.resize(50, 50)
         pre_frame_btn.move(buttonWidget.x() + 60, buttonWidget.y() + 650)
+        #set tooltip
+        pre_frame_btn.setToolTip("Navitage to previous frame")
+        #set shortcut to left arrow
+        pre_frame_btn.setShortcut(Qt.Key_Left)
 
         #nav to next frame
         next_frame_pixmap = QPixmap('Icons/next_frame.png')
@@ -462,6 +529,10 @@ class MainWindow(QMainWindow):
         next_frame_btn.setIcon(next_frame_icon)
         next_frame_btn.resize(50, 50)
         next_frame_btn.move(buttonWidget.x() + 115, buttonWidget.y() + 650)
+        #set tooltip
+        next_frame_btn.setToolTip("Navitage to next frame")
+        #set shortcut to right arrow
+        next_frame_btn.setShortcut(Qt.Key_Right)
 
         #play
         play_pixmap = QPixmap('Icons/play.png')
@@ -482,7 +553,7 @@ class MainWindow(QMainWindow):
         #create a timer to control the play/pause button
         self.timer = QTimer()
         self.timer.timeout.connect(self.timer_timeout)
-        self.timer.setInterval(1000/30) #30 fps
+        self.timer.setInterval(int(1000/30)) #30 fps
 
         #connect the buttons to corresponding functions
         pre_not_labeled_btn.clicked.connect(self.pre_not_labeled_btn_clicked)
@@ -491,336 +562,102 @@ class MainWindow(QMainWindow):
         next_frame_btn.clicked.connect(self.next_frame_btn_clicked)
         play_btn.clicked.connect(self.play_btn_clicked)
         pause_btn.clicked.connect(self.pause_btn_clicked)
+        #connect space key to play/pause button
+        self.space_shortcut = QShortcut(Qt.Key_Space, buttonWidget)
+        self.space_shortcut.activated.connect(self.space_pressed)
+
+    def change_frame(self, frame=-1):
         
+        #if frame is -1, change to the current frame
+        if frame == -1:
+            frame = self.current_frame
+        self.dataloader.set_current_frame(frame)
+        #update the viewer
+        self.viewer.setPhoto(self.get_frame_pixmaps())
+        #update the label
+        self.update_label()
+        #update the skeleton
+        self.update_skeleton()
+        #draw the points
+        self.drawPoints(self.last_frame != self.current_frame)
+        self.last_frame = self.current_frame
+    def get_frame_pixmaps(self):
+        cv_img = self.dataloader.get_frame()
+        cv_img = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+        #convert to pixmap
+        height, width, channel = cv_img.shape
+        bytesPerLine = 3 * width
+        qImg = QImage(cv_img.data, width, height, bytesPerLine, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(qImg)
+        return pixmap
+    def update_skeleton(self):
+        #get the tickboxes that are checked
+        #if self.last_checked_methods != self.checked_methods:
+            self.last_checked_methods = self.checked_methods
+            self.landmarks_data = {}
+            for method in self.checked_methods:
+                pose,hand = self.dataloader.get_current_frame_skeleton(method)
+                self.landmarks_data[method] = [pose, hand]
+            #Todo: update average
+            
+            
 
-
-
-
-
-
-        # upload button connection
-        # uploadImBut.clicked.connect(self.uploadImButClicked)
-        # uploadImBut.setShortcut("ctrl+i")
-        # uploadTeBut.clicked.connect(self.uploadTeButClicked)
-        # uploadTeBut.setShortcut("ctrl+t")
-        # uploadFoBut.clicked.connect(self.uploadFoButClicked)
-        # uploadFoBut.setShortcut("ctrl+f")
-
-        # detection button connection
-        # detectBut.clicked.connect(self.detectButClicked)
-        # detectBut.setShortcut("ctrl+d")
-        # detectClBut.clicked.connect(self.detectClButClicked)
-        # detectClBut.setShortcut("ctrl+c")
-
-        # # save button connectoin
-        # saveBut.clicked.connect(self.saveButClicked)
-        # saveBut.setShortcut("ctrl+s")
-
-        #initiate detector
-        #self.dlib_detector = dlib.get_frontal_face_detector()
-        #self.dlib_predictor = dlib.shape_predictor(
-        #    "./shape_predictor_68_face_landmarks.dat"
-        #)
-
-        self.torch_detector = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, device='cpu')
-
-    def drawPoints(self, points):
-
-        # create Painterpath with text and circle and add them to the viewer
-
-        if len(self.currentImage.landmarkPath) != 0:
-            self.detectClButClicked()
-            self.currentImage.landmarkPath.clear()
-
-        index = 1
-
-        pixmapWidth = self.currentImage.pixmap.width()
-        pixmapHeight = self.currentImage.pixmap.height()
+    def drawPoints(self,next_frame=False):
+        pixmapWidth, pixmapHeight = self.dataloader.get_video_dimension()
         pixmapSize = pixmapHeight * pixmapWidth
 
-        EllipSize = pixmapSize / 1000000
-
-        for x, y in points:
-
-            if index > 68:
-                index = 1
-
-            path = QPainterPath()
-            font = QFont('Times', 2)  # font
-            font.setPointSize(EllipSize + 2)
-            font.setWeight(0.1)  # make font thinner
-            font.setLetterSpacing(QFont.PercentageSpacing, 150)
-            path.addText(5, 5, font, str(index))
-
-            path.addEllipse(0, 0, EllipSize, EllipSize)
-            qPen = QPen()
-
-            # set color for each landmarkPath
-            if index <= 17:
-                qPen.setColor(QColor(150, 0, 0))
-            elif 18 <= index and index <= 26:
-                qPen.setColor(QColor(0, 150, 0))
-            elif 28 <= index and index <= 35:
-                qPen.setColor(QColor(0, 0, 150))
-            elif 37 <= index and index <= 47:
-                qPen.setColor(QColor(100, 100, 100))
-            elif 49 <= index and index <= 68:
-                qPen.setColor(QColor(50, 50, 50))
-
-            # create landmark_point and add them to viwer
-            landmark_path = Landmark_path(path)
-            landmark_path.setPos(x, y)
-            landmark_path.setPen(qPen)
-
-            self.currentImage.landmarkPath.append(landmark_path)
-            self.viewer.addItem(landmark_path)
-
-            index += 1
-
-        self.drawn = True
-
-    def rightArrowButClicked(self):
-
-        # if imageFolder empty, rightArrowBut does not operate
-        if len(self.imageFolder) == 0:
-            pass
-        else:  # if imageFolder is not empty
-
-            # if there is landmark path on scene
-            if self.drawn:
-                self.detectClButClicked()
-
-            if self.imageFolderIndex >= len(self.imageFolder) - 1:
-                self.imageFolderIndex = 0
-            else:
-                self.imageFolderIndex += 1
-
-            # get corresponding image from folder
-            self.currentImage = self.imageFolder[self.imageFolderIndex]
-            self.viewer.setPhoto(self.currentImage.pixmap)
-
-            # if there is text file with points to the image
-            if self.currentImage.name in self.imageFolderText:
-
-                numbers = []
-
-                for line in self.imageFolderText[self.currentImage.name]:
-                    numbers.append(line.split())
-
-                for j in range(0, 2):
-                    for i in range(0, 68):
-                        numbers[i][j] = float(numbers[i][j])
-
-                self.drawPoints(numbers)
-
-            self.textLb.setText('Image :' + str(self.currentImage.name))
-            self.textLb.adjustSize()
-
-    def leftArrowButClicked(self):
-
-        # if imageFolder empty, rightArrowBut does not operate
-        if len(self.imageFolder) == 0:
-            pass
-        else:  # if imageFolder is not empty
-
-            # if there is landmark path on scene
-            if self.drawn:
-                self.detectClButClicked()
-
-            if self.imageFolderIndex <= 0:
-                self.imageFolderIndex = len(self.imageFolder) - 1
-            else:
-                self.imageFolderIndex -= 1
-
-            # get corresponding image from folder
-            self.currentImage = self.imageFolder[self.imageFolderIndex]
-            self.viewer.setPhoto(self.currentImage.pixmap)
-
-            # if there is text file with points to the image
-            if self.currentImage.name in self.imageFolderText:
-
-                numbers = []
-
-                for line in self.imageFolderText[self.currentImage.name]:
-                    numbers.append(line.split())
-
-                for j in range(0, 2):
-                    for i in range(0, 68):
-                        numbers[i][j] = float(numbers[i][j])
-
-                self.drawPoints(numbers)
-
-            self.textLb.setText('Image :' + str(self.currentImage.name))
-            self.textLb.adjustSize()
-
-    def saveButClicked(self):
-        ##
-        if self.currentImage.landmarkPath != []:
-        # get the path of directory where image is located at
-
-            filepath_full = os.path.splitext(self.currentImage.path)[0] + '.txt'
-
-            f = open(filepath_full, 'w')
-            temp = []
-
-            for point in self.currentImage.landmarkPath:
-                f.write(str(point.returnCoordinates()).replace('[', '').replace(']', '') + '\n')
-                temp.append(str(point.returnCoordinates()).replace('[', '').replace(']', '') + '\n')
-
-            if len(self.imageFolder) != 0: #if there is folder
-                if self.currentImage.name in self.imageFolderText: #if there is already corresponding text file, save the changes
-                    self.imageFolderText[self.currentImage.name] = temp
-                else: #if there is no corresponding text file, add it
-                    self.imageFolderText[self.currentImage.name] = temp
-            f.close()
-        else:
-            self.clickMethod()
-
-    def uploadImButClicked(self):
-        # if imageFolder is not empty, empty it
-        if len(self.imageFolder) != 0:
-            self.imageFolder.clear()
-
-        # get the path of file
-        fNamePath = QFileDialog.getOpenFileName(self, "Open Image", "Image Files (*.png *.jpg *.bmp *.jpeg *.gif)")
-        #fNamePath = QFileDialog.getOpenFileName(self, 'Open file', '/home')
-        self.currentImage.path = fNamePath[0]
-
-        if self.currentImage.path == "": #if esc was pressed or no image was chosen, do not set empty path as current image path
-            pass
-        else:
-            # upload images on grpahicView
-            self.currentImage.pixmap = QPixmap(self.currentImage.path)
-            self.viewer.setPhoto(self.currentImage.pixmap)
-            self.textLb.setText('Image :' + str(os.path.basename(self.currentImage.path)))
-            self.textLb.adjustSize()
-
-    def uploadFoButClicked(self):
-        # get the path of selected directory
-        dir_ = QFileDialog.getExistingDirectory(None, 'Open folder:', 'QDir.homePath()', QFileDialog.ShowDirsOnly)
-
-        # if not choose any directory, just pass
-        if not dir_:
-            pass
-        else:
-            # if imageFolder is not empty, empty it
-            if len(self.imageFolder) != 0:
-                self.imageFolder.clear()
-
-            # put each corresponding image into imageFolder
-            for files_ext in sorted(os.listdir(dir_)):
-
-                imagePath = dir_ + '/' + files_ext
-                self.textLb.setText('Image : ' + str(files_ext))
-                self.textLb.adjustSize()
-
-                try:
-                    if imghdr.what(imagePath) is "jpg" or imghdr.what(imagePath) is "png" or imghdr.what(imagePath) is "jpeg" or imghdr.what(imagePath) is "gif":
-                        imagePixmap = QPixmap(imagePath)
-                        image = ImageSet()
-                        image.pixmap = imagePixmap
-                        image.path = imagePath
-                        image.name = files_ext
-
-                        #self.nameLb.setText(image.name)
-                        #self.nameLb.adjustSize()
-
-                        self.imageFolder.append(image)
-                    elif files_ext.endswith(".txt"):
-                        imagePath = dir_ + '/' + files_ext
-                        f = open(imagePath, 'r')
-
-                        points = f.readlines()
-
-                        name = files_ext.replace(".txt", ".jpg")
-
-                        self.imageFolderText[name] = points
+        EllipSize = int(pixmapSize /1000000) #TODO: change to z
+        if next_frame:
+            #if average tickbox is checked, only draw average
+            is_average = self.average_tickbox.isChecked()
+            for method in self.landmarks_data:
+                pose = self.landmarks_data[method][0]
+                hands = self.landmarks_data[method][1]
+                #self.currentImage.landmarkPath
+                #draw pose
+                if method not in self.currentImage.landmarkPath:
+                    self.currentImage.landmarkPath[method] = {'pose':[], 'hands':{}}
+                method_color = tickbox_colors[self.dataloader.get_method_list().index(method)]
+                for i, point in enumerate(pose):
+                    #if the point is not drawn, draw it
+                    if len(self.currentImage.landmarkPath[method]['pose']) <= i:
+                        path = QPainterPath()
+                        font = QFont('Times', 4)
+                        font.setPointSize(EllipSize + 4)
+                        font.setLetterSpacing(QFont.PercentageSpacing, 150)
+                        #show text: P1:visibility.2f
+                        path.addText(5, 5, font, f"P{i+1}")
+                        path.addEllipse(0, 0, EllipSize*3, EllipSize*3)
+                        qPen = QPen()
+                        qPen.setColor(QColor(method_color))
+                        landmark_path = Landmark_path(path, self,method!='average')
+                        landmark_path.setPos(int(point[0]*pixmapWidth), int(point[1]*pixmapHeight))
+                        landmark_path.setPen(qPen)
+                        self.currentImage.landmarkPath[method]['pose'].append(landmark_path)
+                        self.viewer.addItem(landmark_path)
                     else:
-                        pass
-                except IsADirectoryError: #if there is a directory inside folder
-                    self.clickMethod4()
-                    pass
-                except PermissionError:#if there is permission error with the file
-                    self.clickMethod5()
-                    pass
+                        #if the point is already drawn, update it
+                        landmark_path = self.currentImage.landmarkPath[method]['pose'][i]
+                        landmark_path.setPos(int(point[0]*pixmapWidth), int(point[1]*pixmapHeight))
+                        #update label
 
-            self.imageFolderIndex = 0
-
-            if len(self.imageFolder) == 0: #if there is no file in imageFolder
-                pass
-            else:
-                self.currentImage = self.imageFolder[self.imageFolderIndex]
-                self.viewer.setPhoto(self.currentImage.pixmap)
-
-                # if there is text file with points to the image
-                if self.currentImage.name in self.imageFolderText:
-
-                    numbers = []
-
-                    for line in self.imageFolderText[self.currentImage.name]:
-                        numbers.append(line.split())
-
-                    for j in range(0, 2):
-                        for i in range(0, 68):
-                            numbers[i][j] = float(numbers[i][j])
-
-                    self.drawPoints(numbers)
+                        landmark_path.reset()
+                        #if the number of points is less than the number of tickboxes, remove the extra points
+                        if len(self.currentImage.landmarkPath[method]['pose']) > len(pose):
+                            for i in range(len(pose), len(self.currentImage.landmarkPath[method]['pose'])):
+                                self.viewer.scene().removeItem(self.currentImage.landmarkPath[method]['pose'][i])
+                            self.currentImage.landmarkPath[method]['pose'] = self.currentImage.landmarkPath[method]['pose'][:len(pose)]
 
 
-    def uploadTeButClicked(self):
+#TODO: UI show accuracy of each method
+                    
 
-        if not self.viewer.hasPhoto():
-            self.clickMethod3()
-        else:
-            fNamePath = QFileDialog.getOpenFileName(self, "Open text", "/home/", "Text Files (*.txt)")
+    
 
-            # get coordinates from text files
-            textPath = fNamePath[0]
-            filepath_full = os.path.splitext(textPath)[0] + '.txt'
-
-            with open(filepath_full) as data:
-                lines = data.readlines()
-
-            numbers = []
-
-            lineNum = 0
-
-            for line in lines:
-                numbers.append(line.split())
-                lineNum += 1
-
-            if lineNum is 68:
-
-                for j in range(0, 2):
-                    for i in range(0, 68):
-                        numbers[i][j] = float(numbers[i][j])
-
-                self.drawPoints(numbers)
-            else:
-                self.clickMethod2()
-
-    def label_update(self):
-        update = self.currentImage.path
-        #self.textLb.setText(update)
-        #self.textLb.setText("")
-
-    def clickMethod(self):
-        QMessageBox.about(self, "Warning", "Landmark is empty. Try detection again.")
-
-    def clickMethod2(self):
-        QMessageBox.about(self, "Error", " Check text file(*.txt). Some landmarks are missing.")
-
-    def clickMethod3(self):
-        QMessageBox.about(self, "Error", "No photo uploaded")
-
-    def clickMethod4(self):
-        QMessageBox.about(self, "Error", "There is folder file inside")
-
-    def clickMethod5(self):
-        QMessageBox.about(self, "Error", "Permission Error")
+   
 
     def detectClButClicked(self):
-
+        #Pending for deletion
         if not self.viewer.hasPhoto():
             self.clickMethod3()
 
@@ -830,82 +667,7 @@ class MainWindow(QMainWindow):
 
             self.drawn = False
 
-    def detectButClicked(self):
-        if not self.viewer.hasPhoto():
-            self.clickMethod3()
-        elif self.radio1.isChecked():
-            self.pytorch_detect()
-        elif self.radio2.isChecked():
-            self.dlib_detect()
 
-    #adrain detector
-    def pytorch_detect(self):
-        #fa = face_alignment.FaceAlignment(face_alignment.LandmarksType._2D, device='cpu')
-
-        if not self.viewer.highReso:
-            input = io.imread(self.currentImage.path)
-            #self.currentImage.point = self.torch_detector.get_landmarks(input)[-1]
-
-            start_time = time.time()
-            #self.currentImage.point = fa.get_landmarks(input)[-1]
-            self.currentImage.point = self.torch_detector.get_landmarks(input)[-1]
-
-            print("pytorch without init : ---%s seconds ---" %(time.time() - start_time))
-
-        else:
-            self.viewer.pixmap.toImage().save('../tempo.jpg')
-            input = io.imread('../tempo.jpg')
-            os.remove('../tempo.jpg')
-            #self.currentImage.point = self.torch_detector.get_landmarks(input)[-1]
-
-            start_time = time.time()
-
-            #self.currentImage.point = fa.get_landmarks(input)[-1]
-            self.currentImage.point = self.torch_detector.get_landmarks(input)[-1]
-
-            print("pytorch without init : ---%s seconds ---" %(time.time() - start_time))
-
-            xratio = self.viewer.realPixmap.width() / self.viewer.pixmap.width()
-            yratio = self.viewer.realPixmap.height() / self.viewer.pixmap.height()
-
-            newPoint = []
-            for point in self.currentImage.point:
-                newPoint.append(np.array([point[0] * xratio, point[1] * yratio]))
-            self.currentImage.point = newPoint
-
-        self.drawPoints(self.currentImage.point)
-
-    #dlib dector
-    def dlib_detect(self):
-        input = cv2.imread(self.currentImage.path)
-        gray = cv2.cvtColor(input, cv2.COLOR_BGR2GRAY)
-
-        #detector = dlib.get_frontal_face_detector()
-        #predictor = dlib.shape_predictor(
-        #    "./shape_predictor_68_face_landmarks.dat"
-        #)
-
-        #dets = self.dlib_detector(gray, 1)
-
-        start_time = time.time()
-
-        dets = self.dlib_detector(gray, 1)
-
-        #dets = detector(gray, 1)
-        points_all = []
-        for face in dets:
-            shape = self.dlib_predictor(input, face)
-            #shape = predictor(input, face)
-
-            for point in shape.parts():
-                points = [point.x, point.y]
-                points_all.append(points)
-
-        print("dlib without init : ---%s seconds ---" % (time.time() - start_time))
-
-        self.currentImage.point = points_all
-        self.drawPoints(self.currentImage.point)
-    #menu bar
     def _create_menu_bar(self):
         self.menu_bar = self.menuBar()
         self.file_menu = self.menu_bar.addMenu("File")
@@ -961,33 +723,210 @@ class MainWindow(QMainWindow):
         pass
 
     def about_action_triggered(self):
-        pass
+        
+        #show a message box
+        QMessageBox.about(self, "About", "Hand Landmark Editing Tool " + VER + "\n\n" + "Developed by dtungpka\n" +  "Phenikaa University -" + "2023" + "\n\n" + "https://github.com/dtungpka/")
+        
+                                                    
+        
+
 
     #show which radio button was clicked
     def checkboxClicked(self):
-        #show a message box
-        QMessageBox.about(self, "Message", "You clicked " + self.sender().text())
+        self.checked_methods = []
+        for method in self.methods_tickbox:
+            if self.methods_tickbox[method].isChecked():
+                self.checked_methods.append(method)
+        print(self.checked_methods)
+        self.update_skeleton()
+        self.drawPoints(True)
     def videoSourceChanged(self):
+        #if timer is running, stop it
+        if self.timer.isActive():
+            self.timer.stop()
+        
+        if self.sender() == None:
+            selected_alt = self.videoSource.currentText()
+        else:
+            selected_alt = self.sender().currentText()
+
+        #show loading dialog
+        self.loading_dialog = QProgressDialog(f"Loading {selected_alt}...", None, 0, 0, self)
+        self.loading_dialog.setWindowTitle("Loading")
+        self.loading_dialog.setWindowModality(Qt.WindowModal)
+        self.loading_dialog.setCancelButton(None)
+        self.loading_dialog.show()
+        self.current_frame = 0
+        
+        #update the loading dialog
+        QApplication.processEvents()
+        self.loading_dialog.setValue(100)
+        
+        for video in self.alt_names:
+            if self.alt_names[video] == selected_alt:
+                self.current_video = video
+                break
+        self.dataloader.set_video(self.current_video)
+        self.videoNameLb.setText(selected_alt)
+        self.videoNameLb.adjustSize()
+        self.labeled_frame_count, self.labeled_frames = self.gt_data.get_all_labeled_frames(self.current_video)
+
+        #end the loading dialog
+        self.loading_dialog.close()
+        self.frameSlider.setMaximum(self.dataloader.get_total_frames())
+        self.frameSlider.setValue(0)
+        self.frameSlider.setTickInterval(self.dataloader.get_total_frames())
+
+
+
+        msg = "\n".join(["Selected " + selected_alt + " as video source,",
+               "Duration: " + str(self.dataloader.get_total_frames()) + " frames (" + str(self.dataloader.get_duration()) + ")",
+               f"Labeled {self.labeled_frame_count} out of {self.dataloader.get_total_frames()} frames ({self.labeled_frame_count/self.dataloader.get_total_frames():.2%})",
+               f"Avaliable method(s) for this video: {', '.join(self.dataloader.get_current_method_list())}"])
+        
+        #loop through all the tickboxes and set them to unchecked, and disable them if not in the current method list
+        for method in self.methods_tickbox:
+            self.methods_tickbox[method].setChecked(False)
+            if method in self.dataloader.get_current_method_list():
+                self.methods_tickbox[method].setEnabled(True)
+            else:
+                self.methods_tickbox[method].setEnabled(False)
+    
+
         #show a message box
-        QMessageBox.about(self, "Message", "You selected " + self.sender().currentText())
+        QMessageBox.about(self, "Message", msg)
+        
+        self.current_frame = 0
+        self.dataloader.set_current_frame(self.current_frame)
+        self.viewer.setPhoto(self.get_frame_pixmaps(),True)
+        self.update_label()
+        self.update_skeleton()
+        self.drawPoints(True)
+
+    def update_label(self):
+        #update self.videoProgressLb
+        self.labeled_frame_count, self.labeled_frames = self.gt_data.get_all_labeled_frames(self.current_video)
+        _txt = f"Labeled {self.labeled_frame_count} out of {self.dataloader.get_total_frames()} frames ({self.labeled_frame_count/self.dataloader.get_total_frames():.2%})"
+        self.videoProgressLb.setText(_txt)
+        self.videoProgressLb.adjustSize()
+
+        #update self.frameInfoLb
+        _txt = '\n'.join([f"Frame {self.current_frame} out of {self.dataloader.get_total_frames()} ({self.current_frame/self.dataloader.get_total_frames():.2%})",
+                          f'{self.dataloader.get_current_duration()} / {self.dataloader.get_duration()}'])
+        self.frameInfoLb.setText(_txt)
+        self.frameInfoLb.adjustSize()
+
+        #update the slider
+        self.frameSlider.blockSignals(True)
+        self.frameSlider.setValue(self.current_frame)
+        self.frameSlider.blockSignals(False)
+
+
+
+
+
+
     def frameSliderChanged(self):
-        #show a message box
-        QMessageBox.about(self, "Message", "You selected " + str(self.sender().value()))
+        #check if user interacted with the slider
+        # if self.playing_vid:
+        #     self.playing_vid = False
+        #     return
+        
+        #get value from slider
+        value = self.frameSlider.value()
+        #get desired frame
+        desired_frame = int(value)
+        #set desired frame
+        self.current_frame = max(0, min(desired_frame, self.dataloader.get_total_frames() - 1))
+        self.change_frame()
+        
+    def calculate_average_btn_clicked(self):
+        pass
+
 
     def pre_not_labeled_btn_clicked(self):
-        pass
+        self.labeled_frame_count, self.labeled_frames = self.gt_data.get_all_labeled_frames(self.current_video)
+        #loop from current frame to when the next not labeled frame is found
+        desired_frame = self.current_frame
+        found = False
+        while desired_frame > 0 and not found:
+            if desired_frame not in self.labeled_frames:
+                found = True
+                break
+            desired_frame -= 1
+        #find backword if not found
+        if not found:
+            desired_frame = self.current_frame
+            while desired_frame < self.dataloader.get_total_frames() - 1 and not found:
+                if desired_frame not in self.labeled_frames:
+                    found = True
+                    break
+                desired_frame += 1
+        #if not found, show a message box
+        if not found:
+            QMessageBox.about(self, "Info", "All frames have been labeled")
+            return
+        #set desired frame
+        self.current_frame = desired_frame
+        self.change_frame()
     def next_not_labeled_btn_clicked(self):
-        pass
+        self.labeled_frame_count, self.labeled_frames = self.gt_data.get_all_labeled_frames(self.current_video)
+        #loop from current frame to when the next not labeled frame is found
+        desired_frame = self.current_frame
+
+        found = False
+        while desired_frame < self.dataloader.get_total_frames() - 1 and not found:
+            if desired_frame not in self.labeled_frames:
+                found = True
+                break
+            desired_frame += 1
+        #find backword if not found
+        if not found:
+            desired_frame = self.current_frame
+            while desired_frame > 0 and not found:
+                if desired_frame not in self.labeled_frames:
+                    found = True
+                    break
+                desired_frame -= 1
+        #if not found, show a message box
+        if not found:
+            QMessageBox.about(self, "Info", "All frames have been labeled")
+            return
+        #set desired frame
+        self.current_frame = desired_frame
+        self.change_frame()
+
     def pre_frame_btn_clicked(self):
-        pass
+        #if the current frame is the first frame, show a message box
+        if self.current_frame == 0:
+            QMessageBox.about(self, "Warning", "First frame reached")
+            return
+        self.current_frame -= 1
+        self.change_frame()
     def next_frame_btn_clicked(self):
-        pass
+        #if the current frame is the last frame, show a message box
+        if self.current_frame == self.dataloader.get_total_frames() - 1:
+            QMessageBox.about(self, "Warning", "Last frame reached")
+            return
+        self.current_frame += 1
+        self.change_frame()
+    def space_pressed(self):
+        #play or pause the video when space is pressed
+        if self.timer.isActive():
+            self.timer.stop()
+        else:
+            self.timer.start()
     def play_btn_clicked(self):
         self.timer.start()
     def pause_btn_clicked(self):
         self.timer.stop()
     def timer_timeout(self):
-        pass
+        #if the current frame is the last frame, stop the timer
+        if self.current_frame == self.dataloader.get_total_frames() - 1:
+            self.timer.stop()
+            return
+        self.current_frame += 1
+        self.change_frame()
 
 
 
