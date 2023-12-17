@@ -76,6 +76,12 @@ class DataHandler:
         self._fps = self._current_video.get(cv2.CAP_PROP_FPS)
         
         return self.current_video, self.current_video_data
+    def get_current_video(self):
+        '''
+        return the current video name
+        '''
+        assert self.current_video_data is not None, 'No current video is set'
+        return self.current_video
     def get_current_method_list(self):
         '''
         return a list of methods for the current video
@@ -107,6 +113,12 @@ class DataHandler:
         assert self.current_video_data is not None, 'No current video is set'
         assert frame_number < self.total_frame and frame_number >= 0, f'Frame number out of range: {frame_number}'
         self.current_frame = frame_number
+    def get_current_frame(self):
+        '''
+        return the current frame number
+        '''
+        assert self.current_video_data is not None, 'No current video is set'
+        return self.current_frame
     def get_frame(self):
         '''
         return the frame number of the current video

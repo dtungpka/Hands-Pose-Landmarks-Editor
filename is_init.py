@@ -53,15 +53,19 @@ class Outputdata:
             self.data = pkl.load(f)
 
     def get_skeleton(self, video, frame):
+        if video not in self.data:
+            return None
+        if frame not in self.data[video]:
+            return None
         return self.data[video][frame]
     
     def add_skeleton(self, video, frame, skeleton):
         if video not in self.data:
             self.data[video] = {}
         self.history.append((OperationsType.ADD_SKELETON, video, frame, skeleton))
-        self.history_pointer += 1
+        self.history_pointer  = len(self.history)
         self.data[video][frame] = skeleton
-
+        print(f"history added: {OperationsType.ADD_SKELETON}, pointer: {self.history_pointer}/{len(self.history)}")
         #only save the last 100 operations
         if len(self.history) > 100:
             self.history = self.history[-100:]
@@ -76,18 +80,18 @@ class Outputdata:
     def undo_action(self):
         if self.history_pointer > 0:
             self.history_pointer -= 1
-            operation, video, frame, data = self.history[self.history_pointer]
+            print(f'undo: {self.history_pointer}/{len(self.history)}')
+            operation, video, frame, _data = self.history[self.history_pointer]
             if operation == OperationsType.ADD_SKELETON:
-                self.add_skeleton(video, frame,data)
-            elif operation == OperationsType.REMOVE_SKELETON:
-                self.add_skeleton(video, frame,data)
+                self.data[video][frame]=_data
 
 
     def redo_action(self):
         if self.history_pointer < len(self.history):
-            operation, video, frame, data = self.history[self.history_pointer]
+            operation, video, frame, _data = self.history[self.history_pointer]
+            print(f'redo: {self.history_pointer}/{len(self.history)}')
             if operation == OperationsType.ADD_SKELETON:
-                self.add_skeleton(video, frame,data)
+                self.data[video][frame]= _data
             self.history_pointer += 1
     def get_all_labeled_frames(self, video):
         #check if video exists
@@ -173,7 +177,7 @@ class PhotoViewer(QGraphicsView):
 
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
-
+        self.setDragMode(QGraphicsView.RubberBandDrag)
     def hasPhoto(self):
         return not self._empty
 
@@ -232,7 +236,7 @@ class PhotoViewer(QGraphicsView):
 
     def keyReleaseEvent(self, event):
         if event.key() == Qt.Key_Control:
-            self.setDragMode(QGraphicsView.NoDrag)
+            self.setDragMode(QGraphicsView.RubberBandDrag)
 
     def wheelEvent(self, event):
         if self.hasPhoto():
@@ -277,16 +281,38 @@ class Landmark_path(QGraphicsPathItem):
         pos = self.scenePos()
         self.x = pos.x()
         self.y = pos.y()
+        self._z = 0
         self.moved = True
         self.parent = parent
         self.setFlag(QGraphicsItem.ItemIsMovable, moveable)
         self.setFlag(QGraphicsItem.ItemIsSelectable, moveable)
+        self._locked = False
+    def setZ(self, z):
+        self._z = z
+    def getZ(self):
+        return self._z
+
+    def setLocked(self, locked):
+        self._locked = locked
+        self.setFlag(QGraphicsItem.ItemIsMovable, not locked)
+        #change the color of the point to orange if locked
+        if locked:
+            self.setBrush(QBrush(QColor(255, 165, 0)))
+        else:
+            #transparent
+            self.setBrush(QBrush(QColor(0, 0, 0, 0)))
 
     def mousePressEvent(self, event):
         event.accept()
-        super(Landmark_path, self).mousePressEvent(event)
+        if event.button() == Qt.RightButton:
+            print('right')
+        else:
+            super(Landmark_path, self).mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._locked:
+            print("trying to move locked point")
+        self.setFlag(QGraphicsItem.ItemIsMovable, not self._locked)
         event.accept()
         super(Landmark_path, self).mouseMoveEvent(event)
 
@@ -299,14 +325,18 @@ class Landmark_path(QGraphicsPathItem):
         self.y = point.y()
         self.moved = True
         self.parent.update_skeleton()
+        if self.parent.recording:
+            self.parent.save_current_frame_points()
     def reset(self):
         self.moved = False
     def is_moved(self):
         return self.moved
+    def is_locked(self):
+        return self._locked
     def returnCoordinates(self):
         self.x = self.scenePos().x()
         self.y = self.scenePos().y()
-        return np.array([self.x, self.y])
+        return np.array([self.x, self.y, self._z])
 
 
 class MainWindow(QMainWindow):
@@ -325,6 +355,7 @@ class MainWindow(QMainWindow):
         self.landmarks_data = {}  # landmarks data of current frame
         self.last_checked_methods = []
         self.checked_methods = []
+        self.methods_accuracy = {}
         self.drawn = False #whether landmarks are drawn or not
         self.data_path = self.get_data_path()  # get the path of metadata.json
         self.data_folder = os.path.dirname(self.data_path)  # get the path of data folder
@@ -333,6 +364,11 @@ class MainWindow(QMainWindow):
         self.alt_names = self.dataloader.get_alt_name()
         self.playing_vid = False  # whether the video is playing or not
         self.current_frame = 0  # current frame
+        self.view_landmark_name = True  # whether the landmark name is shown or not
+        self.recording = False
+        self.skeleton_source = 'average'
+        self.playback_speed = 0.5
+        self.reset_lock_every_frame = False
         self.gt_data = Outputdata()  # initiate output data
         self.initUI()  # initiate UI
         #maximize the window
@@ -340,10 +376,53 @@ class MainWindow(QMainWindow):
         #show the window
         self.show()
         self.videoSourceChanged()
+        self.get_accuracy()
+        self.viewer.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.viewer.customContextMenuRequested.connect(self.showContextMenu)
+        self.record_btn.setEnabled(self.playback_speed != 1)
+
+    def showContextMenu(self, pos):
+        _locked = False
+        selectedItems = self.viewer.items()
+        selected_points = []
+        for item in selectedItems:
+            if item.isSelected():
+                selected_points.append(item)
+                _locked = item.is_locked()
+        # Get the position of the right-click event
+        globalPos = self.viewer.mapToGlobal(pos)
+        menu = QMenu(self.viewer)
+        # Get the selected items at the right-click position
+        
+        lockAction = menu.addAction("Lock")
+        # Create a context menu
+        
+        lockAction.setEnabled(True)
+        
+        # Check if any selected item is right-clicked
+        
+        lockAction.setCheckable(True)
+        lockAction.setChecked(_locked)
+        
+        if len(selected_points) > 0:
+            
+            # Add a "Lock" option to the context menu, with a tick mark if the item is locked
+            
+            #when clicked, loop through all the selected points and lock/unlock them
+            lockAction.triggered.connect(lambda: [self.lockItem(item) for item in selected_points])
+        else:
+            #disable
+            lockAction.setEnabled(False)
+
+                
 
 
 
-
+        # Show the context menu at the right-click position
+        menu.exec_(globalPos)
+    def lockItem(self, item):
+        # Update the item's locked property or flag
+        item.setLocked(not item.is_locked())
 
 
 
@@ -445,11 +524,19 @@ class MainWindow(QMainWindow):
         self.videoProgressLb.setFont(QFont("Book Antiqua", 10, QFont.Bold))
         self.videoProgressLb.move(buttonWidget.x(), buttonWidget.y() + 335)
 
+        # red (Recording) if recording
+        self.recordingLb = QLabel("                              ", buttonWidget)
+        self.recordingLb.setFont(QFont("Book Antiqua", 10, QFont.Bold))
+        self.recordingLb.move(buttonWidget.x() , buttonWidget.y() + 365)
+        self.recordingLb.setStyleSheet("color:red")
+
+
         
         # create detect label
-        detectLb = QLabel("Info", buttonWidget)
-        detectLb.setFont(QFont("Book Antiqua", 14, QFont.Bold))
-        detectLb.move(buttonWidget.x(), buttonWidget.y() + 450)
+        self.detectLb = QLabel("Frame 0: Not labeled       ", buttonWidget)
+        self.detectLb.setStyleSheet("color:red")
+        self.detectLb.setFont(QFont("Book Antiqua", 14, QFont.Bold))
+        self.detectLb.move(buttonWidget.x(), buttonWidget.y() + 450)
 
         #Add a text label below, show:
         #Frame %d out of %d (%f.2%)
@@ -498,18 +585,6 @@ class MainWindow(QMainWindow):
         #set shortcut to upper arrow
         pre_not_labeled_btn.setShortcut(Qt.Key_Up)
 
-        #nav to next not labeled frame
-        next_not_labeled_pixmap = QPixmap('Icons/next_not_labeled.png')
-        next_not_labeled_icon = QIcon(next_not_labeled_pixmap)
-        next_not_labeled_btn = QPushButton(buttonWidget)
-        next_not_labeled_btn.setIcon(next_not_labeled_icon)
-        next_not_labeled_btn.resize(50, 50)
-        next_not_labeled_btn.move(buttonWidget.x() + 170, buttonWidget.y() + 650)
-        #set tooltip
-        next_not_labeled_btn.setToolTip("Navitage to next not labeled frame")
-        #set shortcut to down arrow
-        next_not_labeled_btn.setShortcut(Qt.Key_Down)
-
         #nav to pre frame
         pre_frame_pixmap = QPixmap('Icons/pre_frame.png')
         pre_frame_icon = QIcon(pre_frame_pixmap)
@@ -522,6 +597,10 @@ class MainWindow(QMainWindow):
         #set shortcut to left arrow
         pre_frame_btn.setShortcut(Qt.Key_Left)
 
+      
+
+        
+
         #nav to next frame
         next_frame_pixmap = QPixmap('Icons/next_frame.png')
         next_frame_icon = QIcon(next_frame_pixmap)
@@ -533,6 +612,44 @@ class MainWindow(QMainWindow):
         next_frame_btn.setToolTip("Navitage to next frame")
         #set shortcut to right arrow
         next_frame_btn.setShortcut(Qt.Key_Right)
+
+          #nav to next not labeled frame
+        next_not_labeled_pixmap = QPixmap('Icons/next_not_labeled.png')
+        next_not_labeled_icon = QIcon(next_not_labeled_pixmap)
+        next_not_labeled_btn = QPushButton(buttonWidget)
+        next_not_labeled_btn.setIcon(next_not_labeled_icon)
+        next_not_labeled_btn.resize(50, 50)
+        next_not_labeled_btn.move(buttonWidget.x() + 170, buttonWidget.y() + 650)
+        #set tooltip
+        next_not_labeled_btn.setToolTip("Navitage to next not labeled frame")
+        #set shortcut to down arrow
+        next_not_labeled_btn.setShortcut(Qt.Key_Down)
+
+        #Record
+        record_pixmap = QPixmap('Icons/videocamera.png')
+        record_icon = QIcon(record_pixmap)
+        self.record_btn = QPushButton(buttonWidget)
+        self.record_btn.setIcon(record_icon)
+        self.record_btn.resize(50, 50)
+        self.record_btn.move(buttonWidget.x() + 5, buttonWidget.y() + 705)
+        #set tooltip
+        self.record_btn.setToolTip("Record")
+        #set shortcut to r
+        self.record_btn.setShortcut(Qt.Key_R)
+
+        #Select skeleton mode
+        skeleton_source_pixmap = QPixmap('Icons/cache.png')
+        skeleton_source_icon = QIcon(skeleton_source_pixmap)
+        self.skeleton_source_btn = QPushButton(buttonWidget)
+        self.skeleton_source_btn.setIcon(skeleton_source_icon)
+        self.skeleton_source_btn.resize(50, 50)
+        self.skeleton_source_btn.move(buttonWidget.x() + 170, buttonWidget.y() + 705)
+        #set tooltip
+        self.skeleton_source_btn.setToolTip("Skeleton source: default")
+        #set shortcut to t
+        self.skeleton_source_btn.setShortcut(Qt.Key_T)
+        self.skeleton_source_btn.setEnabled(False)
+
 
         #play
         play_pixmap = QPixmap('Icons/play.png')
@@ -550,37 +667,85 @@ class MainWindow(QMainWindow):
         pause_btn.resize(50, 50)
         pause_btn.move(buttonWidget.x() + 115, buttonWidget.y() + 705)
 
+        accuracyLb = QLabel("Method accuracy", buttonWidget)
+        accuracyLb.setFont(QFont("Book Antiqua", 14, QFont.Bold))
+        accuracyLb.move(buttonWidget.x(), buttonWidget.y() + 770)
+
+        #create a table to show accuracy of each method
+        self.accuracyTable = QTableWidget(buttonWidget)
+        self.accuracyTable.move(buttonWidget.x() + 5, buttonWidget.y() + 805)
+        self.accuracyTable.resize(250, 150)
+        self.accuracyTable.setColumnCount(2)
+        self.accuracyTable.setHorizontalHeaderLabels(["Method", "Accuracy"])
+        self.accuracyTable.setRowCount(len(self.dataloader.get_method_list()))
+        self.accuracyTable.verticalHeader().setVisible(False)
+        self.accuracyTable.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.accuracyTable.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.accuracyTable.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.accuracyTable.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.accuracyTable.setShowGrid(False)
+        self.accuracyTable.setAlternatingRowColors(True)
+        self.accuracyTable.setSortingEnabled(True)
+        self.accuracyTable.setColumnWidth(0, 150)
+        self.accuracyTable.setColumnWidth(1, 100)
+        self.accuracyTable.setRowCount(len(self.dataloader.get_method_list()))
+        
+
         #create a timer to control the play/pause button
         self.timer = QTimer()
         self.timer.timeout.connect(self.timer_timeout)
-        self.timer.setInterval(int(1000/30)) #30 fps
+        self.timer.setInterval(int(1000/int(30*self.playback_speed))) #30 fps
 
         #connect the buttons to corresponding functions
         pre_not_labeled_btn.clicked.connect(self.pre_not_labeled_btn_clicked)
         next_not_labeled_btn.clicked.connect(self.next_not_labeled_btn_clicked)
         pre_frame_btn.clicked.connect(self.pre_frame_btn_clicked)
         next_frame_btn.clicked.connect(self.next_frame_btn_clicked)
+        self.record_btn.clicked.connect(self.record_btn_clicked)
+        self.skeleton_source_btn.clicked.connect(self.skeleton_source_btn_clicked)
         play_btn.clicked.connect(self.play_btn_clicked)
         pause_btn.clicked.connect(self.pause_btn_clicked)
         #connect space key to play/pause button
         self.space_shortcut = QShortcut(Qt.Key_Space, buttonWidget)
         self.space_shortcut.activated.connect(self.space_pressed)
 
-    def change_frame(self, frame=-1):
+    def update_frame(self, frame=-1):
         
         #if frame is -1, change to the current frame
         if frame == -1:
             frame = self.current_frame
+        if self.last_frame != self.current_frame:
+            if self.recording and 'average' in self.currentImage.landmarkPath:
+                self.save_current_frame_points()
         self.dataloader.set_current_frame(frame)
         #update the viewer
         self.viewer.setPhoto(self.get_frame_pixmaps())
         #update the label
         self.update_label()
+
+        if self.last_frame != self.current_frame:
+            self.get_accuracy()
+            if self.reset_lock_every_frame:
+                self.reset_lock()
+            self.update_skeleton_source_btn()
+
         #update the skeleton
         self.update_skeleton()
         #draw the points
         self.drawPoints(self.last_frame != self.current_frame)
+        
+        
         self.last_frame = self.current_frame
+    def update_skeleton_source_btn(self):
+        #if this frame is labeled, enable the button, else force to average and disable the button
+        if self.gt_data.get_skeleton(self.dataloader.get_current_video(), self.dataloader.get_current_frame()) is not None:
+            self.skeleton_source_btn.setEnabled(True)
+            if self.skeleton_source != 'saved':
+                self.skeleton_source_btn_clicked()
+        else:
+            if self.skeleton_source != 'average':
+                self.skeleton_source_btn_clicked()
+            self.skeleton_source_btn.setEnabled(False)
     def get_frame_pixmaps(self):
         cv_img = self.dataloader.get_frame()
         cv_img = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
@@ -590,71 +755,227 @@ class MainWindow(QMainWindow):
         qImg = QImage(cv_img.data, width, height, bytesPerLine, QImage.Format_RGB888)
         pixmap = QPixmap.fromImage(qImg)
         return pixmap
+    
+    def get_accuracy(self):
+        d = {}
+        for method in self.dataloader.get_current_method_list():
+            d[method] = []
+            pose,hands = self.dataloader.get_current_frame_skeleton(method)
+            for point in pose:
+                d[method].append(point[3])
+            for hand in hands:
+                for i in range(21):
+                    d[method].append(hands[hand]['score'])
+            avg = np.mean(np.array(d[method], dtype=np.float32))
+            #formart to 100.00%
+            self.methods_accuracy[method] = f"{avg*100:.2f}%"
+        #update the table
+        self.update_accuracy_table()
+    def update_accuracy_table(self):
+        for i, method in enumerate(self.methods_accuracy):
+            self.accuracyTable.setItem(i, 0, QTableWidgetItem(method))
+            self.accuracyTable.setItem(i, 1, QTableWidgetItem(self.methods_accuracy[method]))
+
     def update_skeleton(self):
         #get the tickboxes that are checked
         #if self.last_checked_methods != self.checked_methods:
+            pose_len = 0
+            hand_len = 0
             self.last_checked_methods = self.checked_methods
             self.landmarks_data = {}
             for method in self.checked_methods:
                 pose,hand = self.dataloader.get_current_frame_skeleton(method)
-                self.landmarks_data[method] = [pose, hand]
-            #Todo: update average
-            
-            
+                pose_len = len(pose)
+                _hand = {hand[idx]['class']:hand[idx]['landmarks'] for idx in hand}
+                hand_len = 21
+                self.landmarks_data[method] = [pose, _hand]
+
+            #Update when: point moved, chage frame, change video, change method
+            #Loop through all the points, if the point have is_moved() == True, update the skeleton
+            # for method in self.currentImage.landmarkPath:
+            #     for i,_pose in enumerate(self.currentImage.landmarkPath[method]['pose']):
+            #         if _pose.is_moved():
+            #             self.landmarks_data[method][0][i] = _pose.returnCoordinates()
+            current_frame_gt = self.gt_data.get_skeleton(self.dataloader.get_current_video(), self.dataloader.get_current_frame())
+            if current_frame_gt and self.skeleton_source == 'saved':
+                self.landmarks_data['average'] = self.load_frame_points(self.dataloader.get_current_frame())
+            elif len(self.checked_methods) > 0:
+                tmp_average = []
+                tmp_count = []
+                for method in self.checked_methods:
+                    #calculate the average of all the points, ignore the 0,0 points
+                    pose,hand = self.landmarks_data[method]
+                    if len(tmp_average) == 0:
+                        tmp_average = [np.zeros((33, 4)), np.zeros((21, 4)), np.zeros((21, 4))]
+                        tmp_count = [np.zeros(_.shape) for _ in tmp_average]
+                        
+                    
+                    tmp_average[0] += np.array(pose)
+                    if 'Right' in hand:
+                        tmp_average[1] += np.array(hand['Right'])
+                        tmp_count[1] += (np.array(hand['Right']) != 0) * 1
+                    if 'Left' in hand:
+                        tmp_average[2] += np.array(hand['Left'])
+                        tmp_count[2] += (np.array(hand['Left']) != 0) * 1
+                    tmp_count[0] += (np.array(pose) != 0) * 1
+                    
+                    
+                        
+                tmp_average[0] /= tmp_count[0]
+                tmp_average[1] /= tmp_count[1]
+                tmp_average[2] /= tmp_count[2]
+                #replace all inf with 0
+                tmp_average[0][np.isinf(tmp_average[0])] = 0
+                tmp_average[1][np.isinf(tmp_average[1])] = 0
+                tmp_average[2][np.isinf(tmp_average[2])] = 0
+
+                tmp_average[0][np.isnan(tmp_average[0])] = 0
+                tmp_average[1][np.isnan(tmp_average[1])] = 0
+                tmp_average[2][np.isnan(tmp_average[2])] = 0
+                self.landmarks_data['average'] = [tmp_average[0].tolist(), {'Right':tmp_average[1].tolist(), 'Left':tmp_average[2].tolist()}]
+    def save_current_frame_points(self):
+        pixmapWidth, pixmapHeight = self.dataloader.get_video_dimension()
+        _t = np.array([pixmapWidth, pixmapHeight, 1])
+        #get the pos of all the points
+        landmarks = [np.zeros((33, 3)), np.zeros((21, 3)), np.zeros((21, 3))]
+        #loop thr the viewer and get the pos of all the points
+        #pose
+        for i,_pose_point in enumerate(self.currentImage.landmarkPath['average']['pose']):
+            pos = _pose_point.returnCoordinates()
+            landmarks[0][i] = pos / _t
+        #hands
+        for hand in self.currentImage.landmarkPath['average']['hands']:
+            for i,_hand_point in enumerate(self.currentImage.landmarkPath['average']['hands'][hand]):
+                pos = _hand_point.returnCoordinates()
+                landmarks[1 if hand == 'Right' else 2][i] = pos / _t
+        #save the points to the output data
+        self.gt_data.add_skeleton(self.dataloader.get_current_video(), self.dataloader.get_current_frame(), landmarks)
+    def load_frame_points(self, frame):
+        #get the points of the frame from the output data, format simmilar to self.landmarks_data['average']
+        #return None if the frame is not labeled
+        _landmarks = self.gt_data.get_skeleton(self.dataloader.get_current_video(), frame)
+        if _landmarks is None:
+            return None
+        return [_landmarks[0].tolist(), {'Right':_landmarks[1].tolist(), 'Left':_landmarks[2].tolist()}]
+    
+
+
+
+                    
+    def reset_lock(self):
+        for method in self.currentImage.landmarkPath:
+            for _pose in self.currentImage.landmarkPath[method]['pose']:
+                _pose.setLocked(False)
+            for hand in self.currentImage.landmarkPath[method]['hands']:
+                for _hand in self.currentImage.landmarkPath[method]['hands'][hand]:
+                    _hand.setLocked(False)
 
     def drawPoints(self,next_frame=False):
         pixmapWidth, pixmapHeight = self.dataloader.get_video_dimension()
         pixmapSize = pixmapHeight * pixmapWidth
-
-        EllipSize = int(pixmapSize /1000000) #TODO: change to z
+        EllipSize = int(pixmapSize /1000000) 
+        
         if next_frame:
             #if average tickbox is checked, only draw average
             is_average = self.average_tickbox.isChecked()
+            #if if method in self.currentImage.landmarkPath but not in self.landmarks_data, loop through all the points and remove them
+            for method in self.currentImage.landmarkPath:
+                self.methods_accuracy[method] = 0
+                if method not in self.landmarks_data or is_average:
+                    #set the method accuracy to 0
+                    if is_average and method == 'average':
+                        continue
+                    for i in range(len(self.currentImage.landmarkPath[method]['pose'])):
+                        self.viewer.scene().removeItem(self.currentImage.landmarkPath[method]['pose'][i])
+                    self.currentImage.landmarkPath[method]['pose'] = []
+                    for hand in self.currentImage.landmarkPath[method]['hands']:
+                        for i in range(len(self.currentImage.landmarkPath[method]['hands'][hand])):
+                            self.viewer.scene().removeItem(self.currentImage.landmarkPath[method]['hands'][hand][i])
+                        self.currentImage.landmarkPath[method]['hands'][hand] = []
             for method in self.landmarks_data:
+                if is_average and method != 'average':
+                    continue
                 pose = self.landmarks_data[method][0]
                 hands = self.landmarks_data[method][1]
                 #self.currentImage.landmarkPath
                 #draw pose
                 if method not in self.currentImage.landmarkPath:
                     self.currentImage.landmarkPath[method] = {'pose':[], 'hands':{}}
-                method_color = tickbox_colors[self.dataloader.get_method_list().index(method)]
+                method_color = average_color if method == 'average' else tickbox_colors[self.dataloader.get_method_list().index(method)]
                 for i, point in enumerate(pose):
                     #if the point is not drawn, draw it
                     if len(self.currentImage.landmarkPath[method]['pose']) <= i:
                         path = QPainterPath()
-                        font = QFont('Times', 4)
+                        font = QFont('Times', 1)
                         font.setPointSize(EllipSize + 4)
                         font.setLetterSpacing(QFont.PercentageSpacing, 150)
                         #show text: P1:visibility.2f
-                        path.addText(5, 5, font, f"P{i+1}")
-                        path.addEllipse(0, 0, EllipSize*3, EllipSize*3)
+                        if self.view_landmark_name:
+                            path.addText(6, 5, font, f"P{i+1}")
+                        z = (point[2]*1.2 + 1)
+                        rect = QRectF(-2, -2, 4 + z, 4 + z)
+                        path.addEllipse(rect)
                         qPen = QPen()
                         qPen.setColor(QColor(method_color))
-                        landmark_path = Landmark_path(path, self,method!='average')
+                        landmark_path = Landmark_path(path, self,method=='average')
                         landmark_path.setPos(int(point[0]*pixmapWidth), int(point[1]*pixmapHeight))
+                        landmark_path.setZ(point[2])
                         landmark_path.setPen(qPen)
                         self.currentImage.landmarkPath[method]['pose'].append(landmark_path)
                         self.viewer.addItem(landmark_path)
                     else:
                         #if the point is already drawn, update it
                         landmark_path = self.currentImage.landmarkPath[method]['pose'][i]
-                        landmark_path.setPos(int(point[0]*pixmapWidth), int(point[1]*pixmapHeight))
-                        #update label
+                        if not landmark_path.is_locked() or (point[0] != 0 and point[1] != 0):
+                            landmark_path.setPos(int(point[0]*pixmapWidth), int(point[1]*pixmapHeight))
+                            landmark_path.setZ(point[2])
+                            #update label
 
-                        landmark_path.reset()
-                        #if the number of points is less than the number of tickboxes, remove the extra points
-                        if len(self.currentImage.landmarkPath[method]['pose']) > len(pose):
-                            for i in range(len(pose), len(self.currentImage.landmarkPath[method]['pose'])):
-                                self.viewer.scene().removeItem(self.currentImage.landmarkPath[method]['pose'][i])
-                            self.currentImage.landmarkPath[method]['pose'] = self.currentImage.landmarkPath[method]['pose'][:len(pose)]
-
-
-#TODO: UI show accuracy of each method
-                    
-
-    
-
-   
+                            landmark_path.reset()
+                            #if the number of points is less than the number of tickboxes, remove the extra points
+                            if len(self.currentImage.landmarkPath[method]['pose']) > len(pose):
+                                for i in range(len(pose), len(self.currentImage.landmarkPath[method]['pose'])):
+                                    self.viewer.scene().removeItem(self.currentImage.landmarkPath[method]['pose'][i])
+                                self.currentImage.landmarkPath[method]['pose'] = self.currentImage.landmarkPath[method]['pose'][:len(pose)]
+                #draw hands
+                for hand in hands:
+                    if hand not in self.currentImage.landmarkPath[method]['hands']:
+                        self.currentImage.landmarkPath[method]['hands'][hand] = []
+                    for i, point in enumerate(hands[hand]):
+                        #if the point is not drawn, draw it
+                        if len(self.currentImage.landmarkPath[method]['hands'][hand]) <= i:
+                            path = QPainterPath()
+                            font = QFont('Times', 1)
+                            font.setPointSize(EllipSize + 4)
+                            font.setLetterSpacing(QFont.PercentageSpacing, 150)
+                            #show text: P1:visibility.2f
+                            if self.view_landmark_name:
+                                path.addText(6, 5, font, f"{'L' if hand == 'Left' else 'R'}{i+1}")
+                            z = (point[2]*1.2 + 1)
+                            rect = QRectF(-2, -2, 4 + z, 4 + z)
+                            path.addEllipse(rect)
+                            qPen = QPen()
+                            qPen.setColor(QColor(method_color))
+                            landmark_path = Landmark_path(path, self,method=='average')
+                            landmark_path.setPos(int(point[0]*pixmapWidth), int(point[1]*pixmapHeight))
+                            landmark_path.setZ(point[2])
+                            landmark_path.setPen(qPen)
+                            self.currentImage.landmarkPath[method]['hands'][hand].append(landmark_path)
+                            self.viewer.addItem(landmark_path)
+                        else:
+                            #if the point is already drawn, update it
+                            landmark_path = self.currentImage.landmarkPath[method]['hands'][hand][i]
+                            if not landmark_path.is_locked():
+                                landmark_path.setPos(int(point[0]*pixmapWidth), int(point[1]*pixmapHeight))
+                                landmark_path.setZ(point[2])
+                                #update label
+                                landmark_path.reset()
+                                #if the number of points is less than the number of tickboxes, remove the extra points
+                                if len(self.currentImage.landmarkPath[method]['hands'][hand]) > len(hands[hand]):
+                                    for i in range(len(hands[hand]), len(self.currentImage.landmarkPath[method]['hands'][hand])):
+                                        self.viewer.scene().removeItem(self.currentImage.landmarkPath[method]['hands'][hand][i])
+                                    self.currentImage.landmarkPath[method]['hands'][hand] = self.currentImage.landmarkPath[method]['hands'][hand][:len(hands[hand])]
+        
 
     def detectClButClicked(self):
         #Pending for deletion
@@ -664,7 +985,6 @@ class MainWindow(QMainWindow):
         else:
             for landmarkPath in self.currentImage.landmarkPath: #remove landmarkpath in image
                 self.viewer.scene().removeItem(landmarkPath)
-
             self.drawn = False
 
 
@@ -672,10 +992,12 @@ class MainWindow(QMainWindow):
         self.menu_bar = self.menuBar()
         self.file_menu = self.menu_bar.addMenu("File")
         self.edit_menu = self.menu_bar.addMenu("Edit")
+        self.view_menu = self.menu_bar.addMenu("View")
         self.help_menu = self.menu_bar.addMenu("Help")
 
         self._create_file_menu_actions()
         self._create_edit_menu_actions()
+        self._create_view_menu_actions()
         self._create_help_menu_actions()
 
     def _create_file_menu_actions(self):
@@ -705,22 +1027,114 @@ class MainWindow(QMainWindow):
         self.redo_action.triggered.connect(self.redo_action_triggered)
         self.edit_menu.addAction(self.redo_action)
 
+        #add a separator, below a select playback speed, with option to tick: 1x, 0.5x, 0.25x, 0.1x
+        self.edit_menu.addSeparator()
+
+        #add a tick: reset lock: a tick box
+        self.reset_lock_action = QAction("Reset lock", self)
+        self.reset_lock_action.setShortcut("Ctrl+L")
+        self.reset_lock_action.setCheckable(True)
+        self.reset_lock_action.setChecked(self.reset_lock_every_frame)
+        self.reset_lock_action.triggered.connect(self.reset_lock_action_triggered)
+        self.edit_menu.addAction(self.reset_lock_action)
+
+
+
+
+        self.playback_speed_menu = QMenu("Playback speed", self)
+        self.playback_speed_menu.setTearOffEnabled(True)
+        self.edit_menu.addMenu(self.playback_speed_menu)
+        #for
+        playback_options = [2 , 1, 0.5, 0.25, 0.1]
+        self.playback_speed_actions = {}
+        for i, option in enumerate(playback_options):
+            self.playback_speed_actions[option] = QAction(str(option) + "x", self)
+            self.playback_speed_actions[option].setCheckable(True)
+            self.playback_speed_actions[option].setChecked(option == 0.5)
+            self.playback_speed_actions[option].triggered.connect(self.playback_speed_action_triggered)
+            self.playback_speed_menu.addAction(self.playback_speed_actions[option])
+        
+    
+
+    def _create_view_menu_actions(self):
+        # a boolean to draw text on landmarks or not (Landmarks label)
+        self.landmarks_label_action = QAction("Show landmarks name", self)
+        self.landmarks_label_action.setCheckable(True)
+        self.landmarks_label_action.setChecked(True)
+        self.landmarks_label_action.triggered.connect(self.landmarks_label_action_triggered)
+        self.view_menu.addAction(self.landmarks_label_action)
+
     def _create_help_menu_actions(self):
         self.about_action = QAction("About", self)
         self.about_action.triggered.connect(self.about_action_triggered)
         self.help_menu.addAction(self.about_action)
 
     def open_action_triggered(self):
-        pass
+        #open a dialog to select the input data
+        #then call the open function from gt
+        open_dialog = QFileDialog(self)
+        open_dialog.setFileMode(QFileDialog.AnyFile)
+        open_dialog.setAcceptMode(QFileDialog.AcceptOpen)
+        open_dialog.setNameFilter("Ground truth landmark files (*.glmks)")
+        if open_dialog.exec_():
+            filename = open_dialog.selectedFiles()[0]
+            self.gt_data.load(filename)
+            self.update_frame()
+
+    def reset_lock_action_triggered(self):
+        self.reset_lock_every_frame = self.reset_lock_action.isChecked()
+
 
     def save_action_triggered(self):
-        pass
+        #open a dialog to save the output data with .lmks extension
+        #then call the save function from gt
+        save_dialog = QFileDialog(self)
+        save_dialog.setFileMode(QFileDialog.AnyFile)
+        save_dialog.setAcceptMode(QFileDialog.AcceptSave)
+        save_dialog.setNameFilter("Ground truth landmark files (*.glmks)")
+        save_dialog.setDefaultSuffix("glmks")
+        if save_dialog.exec_():
+            filename = save_dialog.selectedFiles()[0]
+            self.gt_data.save(filename)
 
     def undo_action_triggered(self):
-        pass
+        #call the undo function from gt and update the viewer
+        self.gt_data.undo_action()
+        self.update_frame()
+        self.drawPoints(True)
+        
 
     def redo_action_triggered(self):
-        pass
+        #call the redo function from gt and update the viewer
+        self.gt_data.redo_action()
+        self.update_frame()
+        self.drawPoints(True)
+    def playback_speed_action_triggered(self):
+        for option in self.playback_speed_actions:
+            if self.playback_speed_actions[option].isChecked() and not self.playback_speed == option:
+                self.playback_speed = option
+                self.timer.setInterval(int(1000/int(30*self.playback_speed))) #30 fps
+                #disable all other options
+                for _option in self.playback_speed_actions:
+                    if _option != option:
+                        self.playback_speed_actions[_option].setChecked(False)
+        #if 1x is selected, disable the record button
+        self.record_btn.setEnabled(self.playback_speed < 1)
+    def landmarks_label_action_triggered(self):
+        self.view_landmark_name = self.landmarks_label_action.isChecked()
+        for method in self.landmarks_data:
+            #if average tickbox is checked, only draw average
+            is_average = self.average_tickbox.isChecked()
+            if is_average and method != 'average':
+                continue
+            for i in range(len(self.currentImage.landmarkPath[method]['pose'])):
+                            self.viewer.scene().removeItem(self.currentImage.landmarkPath[method]['pose'][i])
+            self.currentImage.landmarkPath[method]['pose'] = []
+            for hand in self.currentImage.landmarkPath[method]['hands']:
+                for i in range(len(self.currentImage.landmarkPath[method]['hands'][hand])):
+                    self.viewer.scene().removeItem(self.currentImage.landmarkPath[method]['hands'][hand][i])
+                self.currentImage.landmarkPath[method]['hands'][hand] = []
+        self.drawPoints(True)
 
     def about_action_triggered(self):
         
@@ -810,6 +1224,18 @@ class MainWindow(QMainWindow):
         self.videoProgressLb.setText(_txt)
         self.videoProgressLb.adjustSize()
 
+        #update self.detectLb
+        ske = self.gt_data.get_skeleton(self.current_video, self.current_frame)
+        #if the current frame is labeled, show Labeld, else show Not labeled
+        if ske is not None:
+            #set color to green
+            self.detectLb.setStyleSheet("color:green")
+            self.detectLb.setText(f"Frame {self.current_frame}: Labeled               ")
+        else:
+            #set color to red
+            self.detectLb.setStyleSheet("color:red")
+            self.detectLb.setText(f"Frame {self.current_frame}: Not labeled           ")
+
         #update self.frameInfoLb
         _txt = '\n'.join([f"Frame {self.current_frame} out of {self.dataloader.get_total_frames()} ({self.current_frame/self.dataloader.get_total_frames():.2%})",
                           f'{self.dataloader.get_current_duration()} / {self.dataloader.get_duration()}'])
@@ -838,7 +1264,7 @@ class MainWindow(QMainWindow):
         desired_frame = int(value)
         #set desired frame
         self.current_frame = max(0, min(desired_frame, self.dataloader.get_total_frames() - 1))
-        self.change_frame()
+        self.update_frame()
         
     def calculate_average_btn_clicked(self):
         pass
@@ -846,7 +1272,6 @@ class MainWindow(QMainWindow):
 
     def pre_not_labeled_btn_clicked(self):
         self.labeled_frame_count, self.labeled_frames = self.gt_data.get_all_labeled_frames(self.current_video)
-        #loop from current frame to when the next not labeled frame is found
         desired_frame = self.current_frame
         found = False
         while desired_frame > 0 and not found:
@@ -854,21 +1279,13 @@ class MainWindow(QMainWindow):
                 found = True
                 break
             desired_frame -= 1
-        #find backword if not found
-        if not found:
-            desired_frame = self.current_frame
-            while desired_frame < self.dataloader.get_total_frames() - 1 and not found:
-                if desired_frame not in self.labeled_frames:
-                    found = True
-                    break
-                desired_frame += 1
         #if not found, show a message box
         if not found:
-            QMessageBox.about(self, "Info", "All frames have been labeled")
+            QMessageBox.about(self, "Info", "All frames before this have been labeled")
             return
         #set desired frame
         self.current_frame = desired_frame
-        self.change_frame()
+        self.update_frame()
     def next_not_labeled_btn_clicked(self):
         self.labeled_frame_count, self.labeled_frames = self.gt_data.get_all_labeled_frames(self.current_video)
         #loop from current frame to when the next not labeled frame is found
@@ -880,21 +1297,13 @@ class MainWindow(QMainWindow):
                 found = True
                 break
             desired_frame += 1
-        #find backword if not found
-        if not found:
-            desired_frame = self.current_frame
-            while desired_frame > 0 and not found:
-                if desired_frame not in self.labeled_frames:
-                    found = True
-                    break
-                desired_frame -= 1
         #if not found, show a message box
         if not found:
-            QMessageBox.about(self, "Info", "All frames have been labeled")
+            QMessageBox.about(self, "Info", "All frames after this have been labeled")
             return
         #set desired frame
         self.current_frame = desired_frame
-        self.change_frame()
+        self.update_frame()
 
     def pre_frame_btn_clicked(self):
         #if the current frame is the first frame, show a message box
@@ -902,14 +1311,50 @@ class MainWindow(QMainWindow):
             QMessageBox.about(self, "Warning", "First frame reached")
             return
         self.current_frame -= 1
-        self.change_frame()
+        self.update_frame()
     def next_frame_btn_clicked(self):
         #if the current frame is the last frame, show a message box
         if self.current_frame == self.dataloader.get_total_frames() - 1:
             QMessageBox.about(self, "Warning", "Last frame reached")
             return
         self.current_frame += 1
-        self.change_frame()
+        self.update_frame()
+    def record_btn_clicked(self):
+        #set the recording label to (Recording)
+        if self.recording:
+            self.recording = False
+            self.recordingLb.setText("                              ")
+            #set the image of btn to record
+            record_pixmap = QPixmap('Icons/videocamera.png')
+            record_icon = QIcon(record_pixmap)
+            self.sender().setIcon(record_icon)
+            #if playing, stop the timer
+            if self.timer.isActive():
+                self.timer.stop()
+        else:
+            self.recording = True
+            self.recordingLb.setText("(Recording)")
+            #set the image of btn to stop
+            record_pixmap = QPixmap('Icons/videocamera-record.png')
+            record_icon = QIcon(record_pixmap)
+            self.sender().setIcon(record_icon)
+    def skeleton_source_btn_clicked(self):
+        if self.skeleton_source == 'saved':
+            self.skeleton_source = 'average'
+            self.skeleton_source_btn.setToolTip("Skeleton source: average")
+            #set the image of btn to record
+            skeleton_source_pixmap = QPixmap('Icons/cache.png')
+            skeleton_source_icon = QIcon(skeleton_source_pixmap)
+            self.skeleton_source_btn.setIcon(skeleton_source_icon)
+        else:
+            self.skeleton_source = 'saved'
+            self.skeleton_source_btn.setToolTip("Skeleton source: default")
+            #set the image of btn to stop
+            skeleton_source_pixmap = QPixmap('Icons/saved.png')
+            skeleton_source_icon = QIcon(skeleton_source_pixmap)
+            self.skeleton_source_btn.setIcon(skeleton_source_icon)
+        self.update_skeleton()
+        self.drawPoints(True)
     def space_pressed(self):
         #play or pause the video when space is pressed
         if self.timer.isActive():
@@ -926,7 +1371,7 @@ class MainWindow(QMainWindow):
             self.timer.stop()
             return
         self.current_frame += 1
-        self.change_frame()
+        self.update_frame()
 
 
 
