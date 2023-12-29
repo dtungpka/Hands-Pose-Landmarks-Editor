@@ -15,6 +15,7 @@ import json
 import time
 import data_handler as dh
 import pickle as pkl
+import copy
 
 
 VER = "v1.0"
@@ -62,15 +63,14 @@ class Outputdata:
     def add_skeleton(self, video, frame, skeleton):
         if video not in self.data:
             self.data[video] = {}
-        self.history.append((OperationsType.ADD_SKELETON, video, frame, skeleton))
-        self.history_pointer  = len(self.history)
+        self.history.append((OperationsType.ADD_SKELETON, video, frame, copy.deepcopy(skeleton)))
+        self.history_pointer  += 1
         self.data[video][frame] = skeleton
         print(f"history added: {OperationsType.ADD_SKELETON}, pointer: {self.history_pointer}/{len(self.history)}")
         #only save the last 100 operations
         if len(self.history) > 100:
             self.history = self.history[-100:]
             self.history_pointer = 100
-        
 
     def remove_skeleton(self, video, frame):
         self.history.append((OperationsType.REMOVE_SKELETON, video, frame, self.data[video][frame]))
@@ -80,10 +80,21 @@ class Outputdata:
     def undo_action(self):
         if self.history_pointer > 0:
             self.history_pointer -= 1
+            if self.history[max(self.history_pointer-1,0)][2] != self.history[self.history_pointer][2]:
+                #find and insert 
+                temp_op = None
+                for i in range(self.history_pointer, -1, -1):
+                    if self.history[i][2] == self.history[self.history_pointer][2]:
+                        temp_op = self.history[i]
+                        break
+                if temp_op:
+                    self.history.insert(self.history_pointer, temp_op)
             print(f'undo: {self.history_pointer}/{len(self.history)}')
             operation, video, frame, _data = self.history[self.history_pointer]
             if operation == OperationsType.ADD_SKELETON:
                 self.data[video][frame]=_data
+                return frame
+        return None
 
 
     def redo_action(self):
@@ -93,6 +104,11 @@ class Outputdata:
             if operation == OperationsType.ADD_SKELETON:
                 self.data[video][frame]= _data
             self.history_pointer += 1
+            return frame
+        return None
+    def get_undo_redo_status(self):
+        #return if can undo, redo
+        return self.history_pointer > 0, self.history_pointer < len(self.history)
     def get_all_labeled_frames(self, video):
         #check if video exists
         if video not in self.data:
@@ -308,6 +324,7 @@ class Landmark_path(QGraphicsPathItem):
             print('right')
         else:
             super(Landmark_path, self).mousePressEvent(event)
+            
 
     def mouseMoveEvent(self, event):
         if self._locked:
@@ -596,11 +613,6 @@ class MainWindow(QMainWindow):
         pre_frame_btn.setToolTip("Navitage to previous frame")
         #set shortcut to left arrow
         pre_frame_btn.setShortcut(Qt.Key_Left)
-
-      
-
-        
-
         #nav to next frame
         next_frame_pixmap = QPixmap('Icons/next_frame.png')
         next_frame_icon = QIcon(next_frame_pixmap)
@@ -777,6 +789,10 @@ class MainWindow(QMainWindow):
             self.accuracyTable.setItem(i, 1, QTableWidgetItem(self.methods_accuracy[method]))
 
     def update_skeleton(self):
+            #update undo/redo btn
+            undo_status,redo_status = self.gt_data.get_undo_redo_status()
+            self.undo_action.setEnabled(undo_status)
+            self.redo_action.setEnabled(redo_status)
         #get the tickboxes that are checked
         #if self.last_checked_methods != self.checked_methods:
             pose_len = 0
@@ -839,6 +855,8 @@ class MainWindow(QMainWindow):
         #get the pos of all the points
         landmarks = [np.zeros((33, 3)), np.zeros((21, 3)), np.zeros((21, 3))]
         #loop thr the viewer and get the pos of all the points
+        if not self.landmarks_data['average']:
+            return
         #pose
         for i,_pose_point in enumerate(self.currentImage.landmarkPath['average']['pose']):
             pos = _pose_point.returnCoordinates()
@@ -1099,14 +1117,30 @@ class MainWindow(QMainWindow):
 
     def undo_action_triggered(self):
         #call the undo function from gt and update the viewer
-        self.gt_data.undo_action()
+        undo_frame = self.gt_data.undo_action()
+
+        #if frame, change to that frame
+        if undo_frame:
+            self.update_frame(undo_frame)
+
+        #change skeleton source to saved if not
+        if self.skeleton_source != 'saved':
+            self.skeleton_source_btn_clicked()
+        self.landmarks_data['average'] = self.load_frame_points(self.dataloader.get_current_frame())
+        
+        
         self.update_frame()
         self.drawPoints(True)
         
 
     def redo_action_triggered(self):
         #call the redo function from gt and update the viewer
-        self.gt_data.redo_action()
+        redo_frame = self.gt_data.redo_action()
+        if redo_frame:
+            self.update_frame(redo_frame)
+        if self.skeleton_source != 'saved':
+            self.skeleton_source_btn_clicked()
+        self.landmarks_data['average'] = self.load_frame_points(self.dataloader.get_current_frame())
         self.update_frame()
         self.drawPoints(True)
     def playback_speed_action_triggered(self):
@@ -1218,6 +1252,10 @@ class MainWindow(QMainWindow):
         self.drawPoints(True)
 
     def update_label(self):
+
+        
+
+
         #update self.videoProgressLb
         self.labeled_frame_count, self.labeled_frames = self.gt_data.get_all_labeled_frames(self.current_video)
         _txt = f"Labeled {self.labeled_frame_count} out of {self.dataloader.get_total_frames()} frames ({self.labeled_frame_count/self.dataloader.get_total_frames():.2%})"
@@ -1331,6 +1369,8 @@ class MainWindow(QMainWindow):
             #if playing, stop the timer
             if self.timer.isActive():
                 self.timer.stop()
+            
+            self.save_current_frame_points()
         else:
             self.recording = True
             self.recordingLb.setText("(Recording)")
