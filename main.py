@@ -1,18 +1,14 @@
 import sys
 import os
-import face_alignment
+
 import numpy as np
-import imghdr
-#import dlib
 import cv2
-from skimage import io
+
 from PyQt5.QtGui import *
 from PyQt5.Qt import *
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 import qdarkgraystyle
-import json
-import time
 import data_handler as dh
 import pickle as pkl
 import copy
@@ -23,6 +19,7 @@ tickbox_colors = ["#00ffff", "#008080", "#00ff00", "#808040", "#808080","#8080ff
 average_color = "#ffffff"
 #contains name, points, pixmap image, paths, and landmarkpaths of image
 
+#TODO v1.1: ADD LOCK/UNLOCK FUNCTIONALITY
 class OperationsType:
     ADD_SKELETON = 0
     REMOVE_SKELETON = 1
@@ -30,7 +27,13 @@ class OperationsType:
     REMOVE_KEYPOINT = 3
     MOVE_KEYPOINT = 4
 
+HAND_LINES = [[0,1],[1,2],[2,3],[3,4],
+              [0,5],[5,6],[6,7],[7,8],
+              [0,9],[9,10],[10,11],[11,12],
+              [0,13],[13,14],[14,15],[15,16],
+              [0,17],[17,18],[18,19],[19,20]]
 
+POSE_LINES = [[8,6],[6,5],[5,4],[4,0],[0,1],[1,2],[2,3],[3,7],[9,10]]
 
 class Outputdata:
     '''
@@ -42,8 +45,12 @@ class Outputdata:
     '''
     def __init__(self) -> None:
         self.data = {}
-        self.history = []
+        self.history = {}
         self.history_pointer = 0
+        self.history_frame_count = 0
+        #this to store the most recent frame index of each video. For the purpose of delete the old history
+        self.history_frame_indexs = []
+        self.last_video = None
 
     def save(self, path):
         with open(path, 'wb') as f:
@@ -60,53 +67,74 @@ class Outputdata:
             return None
         return self.data[video][frame]
     
+    
     def add_skeleton(self, video, frame, skeleton):
         if video not in self.data:
             self.data[video] = {}
-        self.history.append((OperationsType.ADD_SKELETON, video, frame, copy.deepcopy(skeleton)))
-        self.history_pointer  += 1
+        if self.last_video != video:
+            self.history = {}
+            self.history_pointer = 0
+            self.history_frame_count = 0
+            self.history_frame_indexs = []
+            self.last_video = video
+        self._add_to_history(frame, skeleton)
         self.data[video][frame] = skeleton
-        print(f"history added: {OperationsType.ADD_SKELETON}, pointer: {self.history_pointer}/{len(self.history)}")
-        #only save the last 100 operations
-        if len(self.history) > 100:
-            self.history = self.history[-100:]
-            self.history_pointer = 100
 
     def remove_skeleton(self, video, frame):
         self.history.append((OperationsType.REMOVE_SKELETON, video, frame, self.data[video][frame]))
         self.history_pointer += 1
         del self.data[video][frame]
 
-    def undo_action(self):
+    def _add_to_history(self,  frame, data):
+        if frame not in self.history:
+            self.history[frame] = []
+        #if current frame history is more than 50, delete the oldest frame
+        if len(self.history[frame]) > 50:
+            del self.history[frame][0]
+
+
+        self.history[frame].append(copy.deepcopy(data))
+        self.history_pointer  = len(self.history[frame])
+        self.history_frame_count += 1
+        #change the index of the history_frame_indexs
+        #tranverse the history_frame_indexs, if the frame is found then move it to the end
+        #if not found, add it to the end
+        
+        
+
+        if frame in self.history_frame_indexs:
+            self.history_frame_indexs.remove(frame)
+        self.history_frame_indexs.append(frame)
+        #only save the last 10 operations, so delete the oldest frame
+        if len(self.history_frame_indexs) > 10:
+            self.history[ self.history_frame_indexs.pop(0)] = []
+        print(f"Added to history: {frame}/{self.history_pointer}/{len(self.history[frame])}")
+        
+
+    def undo_action(self,video, frame):
+        self.history_pointer = self.history_pointer if self.history_pointer >= 0 and self.history_pointer <= len(self.history[frame]) else len(self.history[frame])
         if self.history_pointer > 0:
             self.history_pointer -= 1
-            if self.history[max(self.history_pointer-1,0)][2] != self.history[self.history_pointer][2]:
-                #find and insert 
-                temp_op = None
-                for i in range(self.history_pointer, -1, -1):
-                    if self.history[i][2] == self.history[self.history_pointer][2]:
-                        temp_op = self.history[i]
-                        break
-                if temp_op:
-                    self.history.insert(self.history_pointer, temp_op)
-            print(f'undo: {self.history_pointer}/{len(self.history)}')
-            operation, video, frame, _data = self.history[self.history_pointer]
-            if operation == OperationsType.ADD_SKELETON:
-                self.data[video][frame]=_data
-                return frame
-        return None
-
-
-    def redo_action(self):
-        if self.history_pointer < len(self.history):
-            operation, video, frame, _data = self.history[self.history_pointer]
-            print(f'redo: {self.history_pointer}/{len(self.history)}')
-            if operation == OperationsType.ADD_SKELETON:
-                self.data[video][frame]= _data
-            self.history_pointer += 1
+            _temp_data = self.history[frame][self.history_pointer]
+            self.data[video][frame] = copy.deepcopy(_temp_data)
+            print(f"Undo: {frame}/{self.history_pointer}/{len(self.history[frame])}")
             return frame
         return None
-    def get_undo_redo_status(self):
+
+
+    def redo_action(self,video, frame):
+        if self.history_pointer < len(self.history):
+            _temp_data = self.history[frame][self.history_pointer]
+            self.data[video][frame] = copy.deepcopy(_temp_data)
+            self.history_pointer += 1
+            print(f"Redo: {frame}/{self.history_pointer}/{len(self.history[frame])}")
+            return frame
+        return None
+    def get_undo_redo_status(self,frame):
+        if frame not in self.history:
+            return False, False
+        self.history_pointer = self.history_pointer if self.history_pointer >= 0 and self.history_pointer <= len(self.history[frame]) else len(self.history[frame])
+        
         #return if can undo, redo
         return self.history_pointer > 0, self.history_pointer < len(self.history)
     def get_all_labeled_frames(self, video):
@@ -116,7 +144,6 @@ class Outputdata:
         else:
             #return the number of labeled frames and a list of labeled frames
             return len(self.data[video]), list(self.data[video].keys())
-
 
 
 
@@ -290,19 +317,93 @@ class PhotoViewer(QGraphicsView):
 
 class Landmark_path(QGraphicsPathItem):
 
-    def __init__(self, path, parent=None,moveable=True):
+    def __init__(self, path,id ,keypoint_class, parent=None,method='',line_color=QColor(255, 255, 255)):
         super(Landmark_path, self).__init__()
+        moveable= method == 'average'
+        self.method = method
         self.path = path
         self.setPath(path)
         pos = self.scenePos()
         self.x = pos.x()
         self.y = pos.y()
+        self.id = id
+        self.keypoint_class = keypoint_class
         self._z = 0
         self.moved = True
         self.parent = parent
+        self.line_color = line_color
         self.setFlag(QGraphicsItem.ItemIsMovable, moveable)
         self.setFlag(QGraphicsItem.ItemIsSelectable, moveable)
         self._locked = False
+        self.target_line,self.parent_line = self.get_target()
+        
+        if self.target_line is not None:
+            self.drawLine(self.target_line.x, self.target_line.y)
+    
+    def setPos(self, x, y):
+        self.x = x
+        self.y = y
+        super(Landmark_path, self).setPos(x, y)
+
+
+    def get_target(self):
+        result_target = None
+        result_parent = None
+        #get the target point of this point
+        if self.keypoint_class == 'pose':
+            target_index = None
+            parent_index = None
+            for pair in POSE_LINES:
+                if pair[0] == self.id:
+                    target_index = pair[1]
+                elif pair[1] == self.id:
+                    parent_index = pair[0]
+            #find the target point in parent viewer
+            for item in self.parent.currentImage.landmarkPath[self.method]['pose']:
+                if item.id == target_index:
+                    result_target = item
+                elif item.id == parent_index:
+                    result_parent = item
+            return result_target, result_parent
+        elif 'hands' in self.keypoint_class:
+            target_index = None
+            parent_index = None
+            for pair in HAND_LINES:
+                if pair[0] == self.id:
+                    target_index = pair[1]
+                elif pair[1] == self.id:
+                    parent_index = pair[0]
+            #find the target point in parent viewer
+            for item in self.parent.currentImage.landmarkPath[self.method]['hands'][self.keypoint_class.replace('hands','')]:
+                if item.id == target_index:
+                    result_target = item
+                elif item.id == parent_index:
+                    result_parent = item
+            return result_target, result_parent
+    
+
+
+
+
+    def drawLine(self, target_x, target_y):
+        # check if line already exists, if so, modify it; otherwise, create a new line from current position to target position
+        self.removeLine()
+        if not self.parent.show_skeleton:
+            return
+        if hasattr(self, 'line'):
+            self.line.setLine(self.x, self.y, target_x, target_y)
+            self.line.setPen(QPen(self.line_color, 2, Qt.SolidLine, Qt.RoundCap))
+        else:
+            self.line = QGraphicsLineItem(self.x, self.y, target_x, target_y)
+            self.line.setPen(QPen(self.line_color, 2, Qt.SolidLine, Qt.RoundCap))
+            self.parent.viewer.scene().addItem(self.line)
+
+    def removeLine(self):
+        if hasattr(self, 'line'):
+            self.parent.viewer.scene().removeItem(self.line)
+            del self.line
+
+
     def setZ(self, z):
         self._z = z
     def getZ(self):
@@ -337,10 +438,19 @@ class Landmark_path(QGraphicsPathItem):
         event.accept()
         super(Landmark_path, self).mouseReleaseEvent(event)
         pos = self.scenePos()
-        point = self.mapToScene(pos.x(), pos.y())
-        self.x = point.x()
-        self.y = point.y()
+        #point = self.mapToScene(pos.x(), pos.y())
+
+        #print moved point from (x,y) to (point.x(), point.y())
+        print(f"Moved point {self.id} from ({self.x},{self.y}) to ({pos.x()},{pos.y()})")
+        self.x = pos.x()
+        self.y = pos.y()
         self.moved = True
+        #self.removeLine()
+        self.target_line,self.parent_line = self.get_target()
+        if self.target_line is not None:
+            self.drawLine(self.target_line.x, self.target_line.y)
+        if self.parent_line is not None:
+            self.parent_line.drawLine(self.x, self.y)
         self.parent.update_skeleton()
         if self.parent.recording:
             self.parent.save_current_frame_points()
@@ -354,6 +464,7 @@ class Landmark_path(QGraphicsPathItem):
         self.x = self.scenePos().x()
         self.y = self.scenePos().y()
         return np.array([self.x, self.y, self._z])
+
 
 
 class MainWindow(QMainWindow):
@@ -385,6 +496,7 @@ class MainWindow(QMainWindow):
         self.recording = False
         self.skeleton_source = 'average'
         self.playback_speed = 0.5
+        self.show_skeleton = True
         self.reset_lock_every_frame = False
         self.gt_data = Outputdata()  # initiate output data
         self.initUI()  # initiate UI
@@ -741,6 +853,11 @@ class MainWindow(QMainWindow):
                 self.reset_lock()
             self.update_skeleton_source_btn()
 
+        #update undo/redo btn
+        undo_status,redo_status = self.gt_data.get_undo_redo_status(self.dataloader.get_current_frame())
+        self.undo_action.setEnabled(undo_status)
+        self.redo_action.setEnabled(redo_status)
+
         #update the skeleton
         self.update_skeleton()
         #draw the points
@@ -789,10 +906,7 @@ class MainWindow(QMainWindow):
             self.accuracyTable.setItem(i, 1, QTableWidgetItem(self.methods_accuracy[method]))
 
     def update_skeleton(self):
-            #update undo/redo btn
-            undo_status,redo_status = self.gt_data.get_undo_redo_status()
-            self.undo_action.setEnabled(undo_status)
-            self.redo_action.setEnabled(redo_status)
+            
         #get the tickboxes that are checked
         #if self.last_checked_methods != self.checked_methods:
             pose_len = 0
@@ -855,6 +969,8 @@ class MainWindow(QMainWindow):
         #get the pos of all the points
         landmarks = [np.zeros((33, 3)), np.zeros((21, 3)), np.zeros((21, 3))]
         #loop thr the viewer and get the pos of all the points
+        if not 'average' in self.landmarks_data:
+            return
         if not self.landmarks_data['average']:
             return
         #pose
@@ -895,23 +1011,25 @@ class MainWindow(QMainWindow):
         
         if next_frame:
             #if average tickbox is checked, only draw average
-            is_average = self.average_tickbox.isChecked()
+            is_average_only_ = self.average_tickbox.isChecked()
             #if if method in self.currentImage.landmarkPath but not in self.landmarks_data, loop through all the points and remove them
             for method in self.currentImage.landmarkPath:
                 self.methods_accuracy[method] = 0
-                if method not in self.landmarks_data or is_average:
+                if method not in self.landmarks_data or is_average_only_:
                     #set the method accuracy to 0
-                    if is_average and method == 'average':
+                    if is_average_only_ and method == 'average':
                         continue
                     for i in range(len(self.currentImage.landmarkPath[method]['pose'])):
+                        self.currentImage.landmarkPath[method]['pose'][i].removeLine()
                         self.viewer.scene().removeItem(self.currentImage.landmarkPath[method]['pose'][i])
                     self.currentImage.landmarkPath[method]['pose'] = []
                     for hand in self.currentImage.landmarkPath[method]['hands']:
                         for i in range(len(self.currentImage.landmarkPath[method]['hands'][hand])):
+                            self.currentImage.landmarkPath[method]['hands'][hand][i].removeLine()
                             self.viewer.scene().removeItem(self.currentImage.landmarkPath[method]['hands'][hand][i])
                         self.currentImage.landmarkPath[method]['hands'][hand] = []
             for method in self.landmarks_data:
-                if is_average and method != 'average':
+                if is_average_only_ and method != 'average':
                     continue
                 pose = self.landmarks_data[method][0]
                 hands = self.landmarks_data[method][1]
@@ -935,7 +1053,7 @@ class MainWindow(QMainWindow):
                         path.addEllipse(rect)
                         qPen = QPen()
                         qPen.setColor(QColor(method_color))
-                        landmark_path = Landmark_path(path, self,method=='average')
+                        landmark_path = Landmark_path(path,i,'pose', self,method,QColor(method_color))
                         landmark_path.setPos(int(point[0]*pixmapWidth), int(point[1]*pixmapHeight))
                         landmark_path.setZ(point[2])
                         landmark_path.setPen(qPen)
@@ -947,14 +1065,21 @@ class MainWindow(QMainWindow):
                         if not landmark_path.is_locked() or (point[0] != 0 and point[1] != 0):
                             landmark_path.setPos(int(point[0]*pixmapWidth), int(point[1]*pixmapHeight))
                             landmark_path.setZ(point[2])
+                            if not self.show_skeleton:
+                                landmark_path.removeLine()
                             #update label
 
                             landmark_path.reset()
                             #if the number of points is less than the number of tickboxes, remove the extra points
                             if len(self.currentImage.landmarkPath[method]['pose']) > len(pose):
                                 for i in range(len(pose), len(self.currentImage.landmarkPath[method]['pose'])):
+                                    self.currentImage.landmarkPath[method]['pose'][i].removeLine()
                                     self.viewer.scene().removeItem(self.currentImage.landmarkPath[method]['pose'][i])
                                 self.currentImage.landmarkPath[method]['pose'] = self.currentImage.landmarkPath[method]['pose'][:len(pose)]
+                for keypoint in self.currentImage.landmarkPath[method]['pose']:
+                    target_line,_ = keypoint.get_target()
+                    if target_line is not None:
+                        keypoint.drawLine(target_line.x, target_line.y)
                 #draw hands
                 for hand in hands:
                     if hand not in self.currentImage.landmarkPath[method]['hands']:
@@ -974,7 +1099,7 @@ class MainWindow(QMainWindow):
                             path.addEllipse(rect)
                             qPen = QPen()
                             qPen.setColor(QColor(method_color))
-                            landmark_path = Landmark_path(path, self,method=='average')
+                            landmark_path = Landmark_path(path, i,'hands'+hand, self,method,QColor(method_color))
                             landmark_path.setPos(int(point[0]*pixmapWidth), int(point[1]*pixmapHeight))
                             landmark_path.setZ(point[2])
                             landmark_path.setPen(qPen)
@@ -986,26 +1111,21 @@ class MainWindow(QMainWindow):
                             if not landmark_path.is_locked():
                                 landmark_path.setPos(int(point[0]*pixmapWidth), int(point[1]*pixmapHeight))
                                 landmark_path.setZ(point[2])
+                                if not self.show_skeleton:
+                                    landmark_path.removeLine()
                                 #update label
                                 landmark_path.reset()
                                 #if the number of points is less than the number of tickboxes, remove the extra points
                                 if len(self.currentImage.landmarkPath[method]['hands'][hand]) > len(hands[hand]):
                                     for i in range(len(hands[hand]), len(self.currentImage.landmarkPath[method]['hands'][hand])):
+                                        self.currentImage.landmarkPath[method]['hands'][hand][i].removeLine()
                                         self.viewer.scene().removeItem(self.currentImage.landmarkPath[method]['hands'][hand][i])
                                     self.currentImage.landmarkPath[method]['hands'][hand] = self.currentImage.landmarkPath[method]['hands'][hand][:len(hands[hand])]
-        
-
-    def detectClButClicked(self):
-        #Pending for deletion
-        if not self.viewer.hasPhoto():
-            self.clickMethod3()
-
-        else:
-            for landmarkPath in self.currentImage.landmarkPath: #remove landmarkpath in image
-                self.viewer.scene().removeItem(landmarkPath)
-            self.drawn = False
-
-
+                for hand in self.currentImage.landmarkPath[method]['hands']:
+                    for keypoint in self.currentImage.landmarkPath[method]['hands'][hand]:
+                        target_line,_ = keypoint.get_target()
+                        if target_line is not None:
+                            keypoint.drawLine(target_line.x, target_line.y)
     def _create_menu_bar(self):
         self.menu_bar = self.menuBar()
         self.file_menu = self.menu_bar.addMenu("File")
@@ -1082,6 +1202,13 @@ class MainWindow(QMainWindow):
         self.landmarks_label_action.triggered.connect(self.landmarks_label_action_triggered)
         self.view_menu.addAction(self.landmarks_label_action)
 
+        # a boolean to show or hide the skeleton
+        self.show_skeleton_action = QAction("Show skeleton", self)
+        self.show_skeleton_action.setCheckable(True)
+        self.show_skeleton_action.setChecked(True)
+        self.show_skeleton_action.triggered.connect(self.show_skeleton_action_triggered)
+        self.view_menu.addAction(self.show_skeleton_action)
+
     def _create_help_menu_actions(self):
         self.about_action = QAction("About", self)
         self.about_action.triggered.connect(self.about_action_triggered)
@@ -1117,7 +1244,7 @@ class MainWindow(QMainWindow):
 
     def undo_action_triggered(self):
         #call the undo function from gt and update the viewer
-        undo_frame = self.gt_data.undo_action()
+        undo_frame = self.gt_data.undo_action(self.dataloader.get_current_video(), self.dataloader.get_current_frame())
 
         #if frame, change to that frame
         if undo_frame:
@@ -1135,7 +1262,7 @@ class MainWindow(QMainWindow):
 
     def redo_action_triggered(self):
         #call the redo function from gt and update the viewer
-        redo_frame = self.gt_data.redo_action()
+        redo_frame = self.gt_data.redo_action( self.dataloader.get_current_video(), self.dataloader.get_current_frame())
         if redo_frame:
             self.update_frame(redo_frame)
         if self.skeleton_source != 'saved':
@@ -1168,6 +1295,10 @@ class MainWindow(QMainWindow):
                 for i in range(len(self.currentImage.landmarkPath[method]['hands'][hand])):
                     self.viewer.scene().removeItem(self.currentImage.landmarkPath[method]['hands'][hand][i])
                 self.currentImage.landmarkPath[method]['hands'][hand] = []
+        self.drawPoints(True)
+    def show_skeleton_action_triggered(self):
+        self.show_skeleton = self.show_skeleton_action.isChecked()
+        self.update_skeleton()
         self.drawPoints(True)
 
     def about_action_triggered(self):
@@ -1305,7 +1436,88 @@ class MainWindow(QMainWindow):
         self.update_frame()
         
     def calculate_average_btn_clicked(self):
+        #show a 3 button dialog:
+        #1. From previous frame
+        #2. Average of previous and next frame
+        #3. From next frame
+        #if the current frame is the first frame, disable the first button
+        #if the current frame is the last frame, disable the third button
+
+        #Create a dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Calculate average")
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+        dialog.setFixedSize(300, 100)
+        dialog.setModal(True)
+        dialog.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        dialog.setWindowFlag(Qt.MSWindowsFixedSizeDialogHint, True)
+        dialog.setWindowFlag(Qt.WindowTitleHint, True)
+        dialog.setWindowFlag(Qt.WindowSystemMenuHint, False)
+        dialog.setWindowFlag(Qt.WindowMinimizeButtonHint, False)
+        dialog.setWindowFlag(Qt.WindowMaximizeButtonHint, False)
+
+
+        #Create 3 buttons
+        btn1 = QPushButton("From previous frame", dialog)
+        btn2 = QPushButton("Average of previous and next frame", dialog)
+        btn3 = QPushButton("From next frame", dialog)
+        btn1.move(10, 10)
+        btn2.move(10, 40)
+        btn3.move(10, 70)
+        btn1.clicked.connect(lambda: self.calculate_average_btn_clicked_action(1))
+        btn2.clicked.connect(lambda: self.calculate_average_btn_clicked_action(2))
+        btn3.clicked.connect(lambda: self.calculate_average_btn_clicked_action(3))
+        #if the current frame is the first frame, disable the first button
+        if self.current_frame == 0:
+            btn1.setEnabled(False)
+        #if the current frame is the last frame, disable the third button
+        if self.current_frame == self.dataloader.get_total_frames() - 1:
+            btn3.setEnabled(False)
+        dialog.exec()
+
+    def get_average_skeleton(self, skeletons):
+        tmp_average = []
+        tmp_count = []
+        for (pose,hand) in skeletons:
+            #calculate the average of all the points, ignore the 0,0 points
+            if len(tmp_average) == 0:
+                tmp_average = [np.zeros((33, 4)), np.zeros((21, 4)), np.zeros((21, 4))]
+                tmp_count = [np.zeros(_.shape) for _ in tmp_average]
+                
+            
+            tmp_average[0] += np.array(pose)
+            if 'Right' in hand:
+                tmp_average[1] += np.array(hand['Right'])
+                tmp_count[1] += (np.array(hand['Right']) != 0) * 1
+            if 'Left' in hand:
+                tmp_average[2] += np.array(hand['Left'])
+                tmp_count[2] += (np.array(hand['Left']) != 0) * 1
+            tmp_count[0] += (np.array(pose) != 0) * 1
+            
+            
+                
+        tmp_average[0] /= tmp_count[0]
+        tmp_average[1] /= tmp_count[1]
+        tmp_average[2] /= tmp_count[2]
+        #replace all inf with 0
+        tmp_average[0][np.isinf(tmp_average[0])] = 0
+        tmp_average[1][np.isinf(tmp_average[1])] = 0
+        tmp_average[2][np.isinf(tmp_average[2])] = 0
+
+        tmp_average[0][np.isnan(tmp_average[0])] = 0
+        tmp_average[1][np.isnan(tmp_average[1])] = 0
+        tmp_average[2][np.isnan(tmp_average[2])] = 0
+        return [tmp_average[0].tolist(), {'Right':tmp_average[1].tolist(), 'Left':tmp_average[2].tolist()}]
+    def get_average_skeleton_from_multiple_frame(self, frames):
         pass
+    def calculate_average_btn_clicked_action(self, action):
+        print(f"Action {action} clicked")
+        #close the dialog
+        self.sender().parent().close()
+        #get the desired frame
+        desired_frame = self.current_frame
+        
 
 
     def pre_not_labeled_btn_clicked(self):
