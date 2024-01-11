@@ -1,0 +1,1 @@
+"D:\2023-2024\Research\Facial-Landmark-Editing-Program\HLE-Env\Scripts\pyinstaller.exe" -F -n "HPLE" --add-data "Icons:." -w -i "Icons\Nahida_1.ico" main.py

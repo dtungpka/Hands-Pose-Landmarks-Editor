@@ -167,7 +167,26 @@ class DataHandler:
                     #hand is a dict, landmarks is a list of x,y,z, multiply by width and height to get the pixel value
                     point[0] = point[0]
                     point[1] = point[1]
+        return pose, hand
+    def get_skeleton(self, method, frame, as_pixels=False):
+        '''
+        return pose, hand
+        '''
+        assert self.current_video_data is not None, 'No current video is set'
+        assert method in self.get_current_method_list(), 'Method not found'
+        pose = self.skeleton_data[method]['pose'][frame].copy()
+        hand = self.skeleton_data[method]['hands'][frame].copy()
 
+        if as_pixels:
+            for point in pose:
+                #pose is a list of x,y,z,visibility, multiply by width and height to get the pixel value
+                point[0] = point[0]
+                point[1] = point[1]
+            for hand_ in hand:
+                for point in hand[hand_]['landmarks']:
+                    #hand is a dict, landmarks is a list of x,y,z, multiply by width and height to get the pixel value
+                    point[0] = point[0]
+                    point[1] = point[1]
         return pose, hand
     def pixel_skeleton_to_normalized(self, pose, hand):
         '''

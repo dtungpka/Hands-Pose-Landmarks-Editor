@@ -33,7 +33,7 @@ HAND_LINES = [[0,1],[1,2],[2,3],[3,4],
               [0,13],[13,14],[14,15],[15,16],
               [0,17],[17,18],[18,19],[19,20]]
 
-POSE_LINES = [[8,6],[6,5],[5,4],[4,0],[0,1],[1,2],[2,3],[3,7],[9,10]]
+POSE_LINES = [[8,6],[6,5],[5,4],[4,0],[0,1],[1,2],[2,3],[3,7],[9,10],[16,14],[14,12],[12,11],[11,13],[13,15],[15,17]]
 
 class Outputdata:
     '''
@@ -471,7 +471,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.title = f'Hand Landmark Editing Tool {VER}'
+        self.title = f'Hands Pose Landmark Editor {VER}'
         self.dw = QDesktopWidget()  # fit to the size of desktop
         self.x = 0
         self.y = 0
@@ -498,6 +498,7 @@ class MainWindow(QMainWindow):
         self.playback_speed = 0.5
         self.show_skeleton = True
         self.reset_lock_every_frame = False
+        self.save_path = None
         self.gt_data = Outputdata()  # initiate output data
         self.initUI()  # initiate UI
         #maximize the window
@@ -662,7 +663,7 @@ class MainWindow(QMainWindow):
 
         
         # create detect label
-        self.detectLb = QLabel("Frame 0: Not labeled       ", buttonWidget)
+        self.detectLb = QLabel("Frame 1: Not labeled       ", buttonWidget)
         self.detectLb.setStyleSheet("color:red")
         self.detectLb.setFont(QFont("Book Antiqua", 14, QFont.Bold))
         self.detectLb.move(buttonWidget.x(), buttonWidget.y() + 450)
@@ -1149,6 +1150,12 @@ class MainWindow(QMainWindow):
         self.save_action.triggered.connect(self.save_action_triggered)
         self.file_menu.addAction(self.save_action)
 
+        self.save_as_action = QAction("Save as..", self)
+        self.save_as_action.setShortcut("Ctrl+Shift+S")
+        self.save_as_action.triggered.connect(self.save_as_action_triggered)
+        self.file_menu.addAction(self.save_as_action)
+
+
         self.exit_action = QAction("Exit", self)
         self.exit_action.setShortcut("Ctrl+Q")
         self.exit_action.triggered.connect(self.close)
@@ -1229,8 +1236,21 @@ class MainWindow(QMainWindow):
     def reset_lock_action_triggered(self):
         self.reset_lock_every_frame = self.reset_lock_action.isChecked()
 
-
     def save_action_triggered(self):
+        #open a dialog to save the output data with .lmks extension
+        #then call the save function from gt
+        if self.save_path is None:
+            save_dialog = QFileDialog(self)
+            save_dialog.setFileMode(QFileDialog.AnyFile)
+            save_dialog.setAcceptMode(QFileDialog.AcceptSave)
+            save_dialog.setNameFilter("Ground truth landmark files (*.glmks)")
+            save_dialog.setDefaultSuffix("glmks")
+            if save_dialog.exec_():
+                self.save_path = save_dialog.selectedFiles()[0]
+                self.gt_data.save(self.save_path)
+        else:
+            self.gt_data.save(self.save_path)
+    def save_as_action_triggered(self):
         #open a dialog to save the output data with .lmks extension
         #then call the save function from gt
         save_dialog = QFileDialog(self)
@@ -1241,7 +1261,6 @@ class MainWindow(QMainWindow):
         if save_dialog.exec_():
             filename = save_dialog.selectedFiles()[0]
             self.gt_data.save(filename)
-
     def undo_action_triggered(self):
         #call the undo function from gt and update the viewer
         undo_frame = self.gt_data.undo_action(self.dataloader.get_current_video(), self.dataloader.get_current_frame())
@@ -1399,14 +1418,14 @@ class MainWindow(QMainWindow):
         if ske is not None:
             #set color to green
             self.detectLb.setStyleSheet("color:green")
-            self.detectLb.setText(f"Frame {self.current_frame}: Labeled               ")
+            self.detectLb.setText(f"Frame {self.current_frame + 1}: Labeled               ")
         else:
             #set color to red
             self.detectLb.setStyleSheet("color:red")
-            self.detectLb.setText(f"Frame {self.current_frame}: Not labeled           ")
+            self.detectLb.setText(f"Frame {self.current_frame + 1}: Not labeled           ")
 
         #update self.frameInfoLb
-        _txt = '\n'.join([f"Frame {self.current_frame} out of {self.dataloader.get_total_frames()} ({self.current_frame/self.dataloader.get_total_frames():.2%})",
+        _txt = '\n'.join([f"Frame {self.current_frame + 1} out of {self.dataloader.get_total_frames()} ({self.current_frame/self.dataloader.get_total_frames():.2%})",
                           f'{self.dataloader.get_current_duration()} / {self.dataloader.get_duration()}'])
         self.frameInfoLb.setText(_txt)
         self.frameInfoLb.adjustSize()
@@ -1468,12 +1487,14 @@ class MainWindow(QMainWindow):
         btn1.clicked.connect(lambda: self.calculate_average_btn_clicked_action(1))
         btn2.clicked.connect(lambda: self.calculate_average_btn_clicked_action(2))
         btn3.clicked.connect(lambda: self.calculate_average_btn_clicked_action(3))
-        #if the current frame is the first frame, disable the first button
+        #if the current frame is the first frame, disable the first button and second button
         if self.current_frame == 0:
             btn1.setEnabled(False)
+            btn2.setEnabled(False)
         #if the current frame is the last frame, disable the third button
         if self.current_frame == self.dataloader.get_total_frames() - 1:
             btn3.setEnabled(False)
+            btn2.setEnabled(False)
         dialog.exec()
 
     def get_average_skeleton(self, skeletons):
@@ -1485,8 +1506,11 @@ class MainWindow(QMainWindow):
                 tmp_average = [np.zeros((33, 4)), np.zeros((21, 4)), np.zeros((21, 4))]
                 tmp_count = [np.zeros(_.shape) for _ in tmp_average]
                 
-            
-            tmp_average[0] += np.array(pose)
+            tmp_pose_np = np.array(pose)
+            if tmp_average[0].shape != tmp_pose_np.shape:
+                #padd the tmp_average to the same shape as tmp_pose_np
+                tmp_average[0] = np.pad(tmp_average[0], ((0, tmp_pose_np.shape[0] - tmp_average[0].shape[0]), (0, 0)), 'constant', constant_values=(0))
+            tmp_average[0] += tmp_pose_np
             if 'Right' in hand:
                 tmp_average[1] += np.array(hand['Right'])
                 tmp_count[1] += (np.array(hand['Right']) != 0) * 1
@@ -1509,16 +1533,55 @@ class MainWindow(QMainWindow):
         tmp_average[1][np.isnan(tmp_average[1])] = 0
         tmp_average[2][np.isnan(tmp_average[2])] = 0
         return [tmp_average[0].tolist(), {'Right':tmp_average[1].tolist(), 'Left':tmp_average[2].tolist()}]
-    def get_average_skeleton_from_multiple_frame(self, frames):
-        pass
+    def get_average_skeleton_from_frame_seq(self, frames_range,methods):
+        skeletons = []
+        for desired_frame in frames_range:
+            satify_pose,satify_hands = False,False
+            skeletons = []
+            for method in methods:
+                pose,hand = self.dataloader.get_skeleton( method,desired_frame)
+                _hand = {hand[idx]['class']:hand[idx]['landmarks'] for idx in hand}
+                if pose is not None and satify_pose == False:
+                    if len(pose) == 33:
+                        satify_pose = True
+                if _hand is not None and satify_hands == False:
+                    if len(_hand) == 2:
+                        if len(_hand['Right']) == 21 and len(_hand['Left']) == 21:
+                            satify_hands = True
+                skeletons.append([pose,_hand])            
+            if satify_pose and satify_hands:
+                break
+        desired_skeleton = self.get_average_skeleton(skeletons)
+        return desired_skeleton
     def calculate_average_btn_clicked_action(self, action):
         print(f"Action {action} clicked")
         #close the dialog
         self.sender().parent().close()
         #get the desired frame
         desired_frame = self.current_frame
-        
+        desired_skeleton = None
+        selected_methods = self.checked_methods
+        if action == 1:
+            r = range(desired_frame, 0, -1)
+            desired_skeleton = self.get_average_skeleton_from_frame_seq(r,selected_methods)
+        if action == 2:
+            f_r = range(desired_frame,self.dataloader.get_total_frames())
+            b_r = range(desired_frame, 0, -1)
+            f_skeleton = self.get_average_skeleton_from_frame_seq(f_r,selected_methods)
+            b_skeleton = self.get_average_skeleton_from_frame_seq(b_r,selected_methods)
+            desired_skeleton = self.get_average_skeleton([f_skeleton,b_skeleton])
+        if action == 3:
+            r = range(desired_frame,self.dataloader.get_total_frames())
+            desired_skeleton = self.get_average_skeleton_from_frame_seq(r,selected_methods)
+        #set gt
+        self.landmarks_data['average'] = self.get_average_skeleton([desired_skeleton,self.landmarks_data['average']])
+        self.drawPoints(True)
+        if self.recording:
+            self.save_current_frame_points()
 
+        
+        
+                        
 
     def pre_not_labeled_btn_clicked(self):
         self.labeled_frame_count, self.labeled_frames = self.gt_data.get_all_labeled_frames(self.current_video)
@@ -1624,7 +1687,6 @@ class MainWindow(QMainWindow):
             return
         self.current_frame += 1
         self.update_frame()
-
 
 
 if __name__ == '__main__':
